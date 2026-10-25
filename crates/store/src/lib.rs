@@ -11,6 +11,7 @@ mod http;
 pub mod ipa;
 pub mod ipatool;
 mod jwe;
+pub mod logging;
 mod models;
 pub mod search;
 

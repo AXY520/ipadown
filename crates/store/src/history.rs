@@ -302,8 +302,23 @@ pub async fn versions(app_id: i64, country: &str) -> Result<VersionCatalog> {
     );
     let mut catalog = catalog?;
     match release_notes {
-        Ok(release_notes) => attach_release_notes(&mut catalog, release_notes),
-        Err(error) => eprintln!("App Store 更新日志获取失败: {error}"),
+        Ok(notes) => {
+            let attached = notes.len();
+            attach_release_notes(&mut catalog, notes);
+            crate::log_info!(
+                "history",
+                "catalog fetched app_id={app_id} country={} versions={} notes={attached}",
+                country.to_ascii_uppercase(),
+                catalog.versions.len()
+            );
+        }
+        Err(error) => {
+            crate::log_warn!(
+                "history",
+                "release notes unavailable app_id={app_id} country={} error={error}",
+                country.to_ascii_uppercase()
+            );
+        }
     }
     Ok(catalog)
 }

@@ -16,8 +16,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncSeekExt;
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
+const APP_JS: &str = include_str!("../static/app.js");
 
 /// 历史版本目录与 App Store 更新日志缓存有效期。
 const HISTORY_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
@@ -91,6 +93,8 @@ impl ArtworkCache {
 #[derive(Clone)]
 struct AppState {
     public_base_url: Option<String>,
+    /// 是否信任反向代理传入的 X-Forwarded-* 头（自建反代时显式开启）。
+    trust_proxy: bool,
     jobs: jobs::Registry,
     versions: Arc<Mutex<VersionsCache>>,
     artwork: Arc<Mutex<ArtworkCache>>,
@@ -108,7 +112,7 @@ struct InstallGrant {
 impl InstallTokens {
     fn issue(&self, file: &str) -> String {
         let token = random_id();
-        let mut grants = self.0.lock().unwrap();
+        let mut grants = lock_ignore_poison(&self.0);
         let now = Instant::now();
         grants.retain(|_, grant| grant.expires_at > now);
         if grants.len() >= MAX_INSTALL_TOKENS {
@@ -131,7 +135,7 @@ impl InstallTokens {
     }
 
     fn allows(&self, token: &str, file: &str) -> bool {
-        let mut grants = self.0.lock().unwrap();
+        let mut grants = lock_ignore_poison(&self.0);
         grants.retain(|_, grant| grant.expires_at > Instant::now());
         grants.get(token).is_some_and(|grant| grant.file == file)
     }
@@ -141,6 +145,11 @@ fn random_id() -> String {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("无法从操作系统获取安全随机数");
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// 锁中毒（持锁线程 panic）时数据本身仍完整，取回继续而不是连环 panic。
+fn lock_ignore_poison<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[derive(Clone)]
@@ -213,7 +222,7 @@ async fn require_basic_auth(
     }
 }
 
-fn apply_security_headers(response: &mut Response) {
+fn apply_security_headers(response: &mut Response, path: &str) {
     let headers = response.headers_mut();
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
@@ -224,23 +233,64 @@ fn apply_security_headers(response: &mut Response) {
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    // 前端已无内联事件处理器与内联脚本，可启用严格 CSP（内联 style 属性仍需要 unsafe-inline）。
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+             img-src 'self' https: data:; connect-src 'self'; object-src 'none'; \
+             base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+        ),
+    );
     headers.insert(
         HeaderName::from_static("permissions-policy"),
         HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
     );
+    // 缓存策略：OTA 走 ETag/Range 条件请求；静态页面可复验；API 响应不落盘。
+    let cache_policy = if path.starts_with("/ota/") {
+        "private, max-age=0, must-revalidate"
+    } else if path == "/" || path == "/app.js" {
+        "no-cache"
+    } else {
+        "no-store"
+    };
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_policy),
+    );
 }
 
 async fn security_headers(request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_string();
     let mut response = next.run(request).await;
-    apply_security_headers(&mut response);
+    apply_security_headers(&mut response, &path);
+    response
+}
+
+/// HTTP 访问日志：方法、路径、状态码、耗时。
+/// 前端轮询端点（任务/文件/健康检查）只在出错时才记录，避免日志噪声。
+async fn http_access_log(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let started = Instant::now();
+    let response = next.run(request).await;
+    let status = response.status().as_u16();
+    let noisy_poll = method == axum::http::Method::GET
+        && (path == "/api/downloads" || path == "/api/files" || path == "/healthz");
+    if !noisy_poll || status >= 400 {
+        store::log_info!(
+            "http",
+            "{method} {path} -> {status} dur={}ms",
+            started.elapsed().as_millis()
+        );
+    }
     response
 }
 
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
-            eprintln!("无法监听 Ctrl+C: {error}");
+            store::log_error!("shutdown", "cannot listen for ctrl-c: {error}");
         }
     };
 
@@ -250,7 +300,7 @@ async fn shutdown_signal() {
             Ok(mut signal) => {
                 signal.recv().await;
             }
-            Err(error) => eprintln!("无法监听 SIGTERM: {error}"),
+            Err(error) => store::log_error!("shutdown", "cannot listen for SIGTERM: {error}"),
         }
     };
     #[cfg(not(unix))]
@@ -260,7 +310,7 @@ async fn shutdown_signal() {
         () = ctrl_c => {},
         () = terminate => {},
     }
-    println!("收到退出信号，正在停止服务…");
+    store::log_info!("shutdown", "signal received, stopping");
 }
 
 async fn wait_for_shutdown(mut receiver: tokio::sync::watch::Receiver<bool>) {
@@ -294,8 +344,11 @@ async fn main() {
 
     // 启动时固化配置（确保 keychain_passphrase 等字段落盘，避免每次启动重新生成）
     match store::config::Config::load_or_create() {
-        Ok(mut cfg) => store::ipatool::migrate_legacy(&mut cfg),
-        Err(e) => eprintln!("配置初始化失败: {e}"),
+        Ok(mut cfg) => {
+            store::ipatool::migrate_legacy(&mut cfg);
+            store::log_info!("startup", "config ready accounts={}", cfg.accounts.len());
+        }
+        Err(e) => store::log_error!("startup", "config init failed error={e}"),
     }
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -305,9 +358,13 @@ async fn main() {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.trim_end_matches('/').to_string());
+    let trust_proxy = std::env::var("IPADOWN_TRUST_PROXY")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
 
     let state = AppState {
-        public_base_url,
+        public_base_url: public_base_url.clone(),
+        trust_proxy,
         jobs: jobs::new_registry(),
         versions: Arc::new(Mutex::new(VersionsCache::default())),
         artwork: Arc::new(Mutex::new(ArtworkCache::default())),
@@ -316,6 +373,18 @@ async fn main() {
 
     let protected = Router::new()
         .route("/", axum::routing::get(|| async { Html(INDEX_HTML) }))
+        .route(
+            "/app.js",
+            axum::routing::get(|| async {
+                (
+                    [(
+                        header::CONTENT_TYPE,
+                        "application/javascript; charset=utf-8",
+                    )],
+                    APP_JS,
+                )
+            }),
+        )
         .route("/api/config", axum::routing::get(api_config))
         .route("/api/auth/login", axum::routing::post(api_login))
         .route("/api/auth/logout", axum::routing::post(api_logout))
@@ -336,7 +405,10 @@ async fn main() {
         Some(auth) => protected.layer(middleware::from_fn_with_state(auth, require_basic_auth)),
         None => {
             if std::env::var_os("IPADOWN_PLATFORM_AUTH").is_none() {
-                eprintln!("警告: 未设置 IPADOWN_WEB_PASSWORD，Web/API 仅应暴露在可信网络中");
+                store::log_warn!(
+                    "startup",
+                    "IPADOWN_WEB_PASSWORD not set; web/api should only be exposed on trusted networks"
+                );
             }
             protected
         }
@@ -350,6 +422,7 @@ async fn main() {
         .route("/ota/{file}/app.ipa", axum::routing::get(ota_ipa));
     let app = ota_routes
         .merge(protected)
+        .layer(middleware::from_fn(http_access_log))
         .layer(middleware::from_fn(security_headers))
         .with_state(state.clone());
 
@@ -359,12 +432,19 @@ async fn main() {
     let tls_cert = std::env::var("TLS_CERT").ok();
     let tls_key = std::env::var("TLS_KEY").ok();
 
+    store::log_info!(
+        "startup",
+        "ipadown-web starting port={port} tls={} public_base_url={} trust_proxy={trust_proxy}",
+        tls_cert.is_some(),
+        public_base_url.as_deref().unwrap_or("<unset>")
+    );
+
     match (tls_cert, tls_key) {
         (Some(cert), Some(key)) => {
             let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
                 .await
                 .expect("TLS 证书加载失败");
-            println!("ipadown-web 已启动 (HTTPS): https://[::]:{port}");
+            store::log_info!("startup", "listening on https://[::]:{port}");
             let handle = axum_server::Handle::new();
             arm_tls_shutdown(handle.clone(), shutdown_receiver);
             if let Err(error) = axum_server::bind_rustls(addr_v6, tls)
@@ -372,13 +452,15 @@ async fn main() {
                 .serve(app.into_make_service())
                 .await
             {
-                eprintln!("HTTPS 服务异常退出: {error}");
+                store::log_error!("startup", "https server exited: {error}");
             }
         }
         _ => {
-            println!("ipadown-web 已启动 (HTTP): http://[::]:{port}");
             if state.public_base_url.is_none() {
-                println!("提示: 未设置 PUBLIC_BASE_URL，浏览器安装需要配置受信 HTTPS 地址");
+                store::log_warn!(
+                    "startup",
+                    "PUBLIC_BASE_URL not set; browser install requires a trusted HTTPS base URL"
+                );
             }
             let listener = match tokio::net::TcpListener::bind(addr_v6).await {
                 Ok(l) => l,
@@ -386,11 +468,12 @@ async fn main() {
                     .await
                     .expect("端口绑定失败"),
             };
+            store::log_info!("startup", "listening on http://[::]:{port}");
             if let Err(error) = axum::serve(listener, app)
                 .with_graceful_shutdown(wait_for_shutdown(shutdown_receiver))
                 .await
             {
-                eprintln!("HTTP 服务异常退出: {error}");
+                store::log_error!("startup", "http server exited: {error}");
             }
         }
     }
@@ -496,28 +579,33 @@ fn ensure_download_space() -> std::result::Result<(), Response> {
 
 /// HTTP/1.1 走 host 头，HTTP/2 的 :authority 由 hyper 写入 URI
 fn req_host<'a>(headers: &'a HeaderMap, uri: &'a axum::http::Uri) -> &'a str {
-    if let Some(h) = headers
-        .get("x-forwarded-host")
-        .and_then(|v| v.to_str().ok())
-    {
-        return h;
-    }
     if let Some(h) = headers.get("host").and_then(|v| v.to_str().ok()) {
         return h;
     }
     uri.authority().map(|a| a.as_str()).unwrap_or("localhost")
 }
 
-/// 决定对外 base URL：优先 PUBLIC_BASE_URL，最后按反向代理头推导。
+/// 决定对外 base URL：优先 PUBLIC_BASE_URL；自建反代可显式开启
+/// IPADOWN_TRUST_PROXY=1 后才信任 X-Forwarded-* 头，避免伪造头注入安装链接。
 fn base_url(state: &AppState, headers: &HeaderMap, uri: &axum::http::Uri) -> String {
     if let Some(u) = &state.public_base_url {
         return u.clone();
     }
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("http");
-    format!("{proto}://{}", req_host(headers, uri))
+    if state.trust_proxy {
+        if let Some(host) = headers
+            .get("x-forwarded-host")
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty())
+        {
+            let proto = headers
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .filter(|v| !v.is_empty())
+                .unwrap_or("http");
+            return format!("{proto}://{host}");
+        }
+    }
+    format!("http://{}", req_host(headers, uri))
 }
 
 // ---------- API ----------
@@ -553,7 +641,8 @@ async fn api_login(State(state): State<AppState>, Json(req): Json<LoginReq>) -> 
         .await
     {
         Ok(session) => {
-            // 从钥匙串 JWE 解出姓名与国家，登记到多账号配置并设为当前账号
+            // 从钥匙串 JWE 解出姓名与国家，登记到多账号配置并设为当前账号。
+            // 登录可能耗时数分钟，在 config 锁内重新加载，避免覆盖期间新增的其他账号。
             let meta = store::ipatool::read_account_meta(&cfg, &login_email)
                 .map(|mut meta| {
                     meta.email = login_email.clone();
@@ -564,17 +653,19 @@ async fn api_login(State(state): State<AppState>, Json(req): Json<LoginReq>) -> 
                     country: None,
                     name: None,
                 });
-            // 登录可能耗时数分钟，成功后重新加载，避免覆盖期间新增的其他账号。
-            let mut latest = match store::config::Config::load_or_create() {
-                Ok(config) => config,
-                Err(error) => return store_err(error),
-            };
-            latest.upsert_account(meta);
-            latest.current_account = Some(login_email.clone());
-            if let Err(error) = latest.save() {
+            if let Err(error) = store::config::update(|latest| {
+                latest.upsert_account(meta);
+                latest.current_account = Some(login_email.clone());
+                Ok(())
+            }) {
                 return store_err(error);
             }
             let cleared_jobs = jobs::clear_two_factor_failures(&state.jobs, &login_email);
+            store::log_info!(
+                "auth",
+                "login ok email={} cleared_jobs={cleared_jobs}",
+                session.email
+            );
             Json(serde_json::json!({
                 "ok": true,
                 "email": session.email,
@@ -582,12 +673,18 @@ async fn api_login(State(state): State<AppState>, Json(req): Json<LoginReq>) -> 
             }))
             .into_response()
         }
-        Err(store::StoreError::CodeRequired) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "ok": false, "code_required": true })),
-        )
-            .into_response(),
-        Err(e) => store_err(e),
+        Err(store::StoreError::CodeRequired) => {
+            store::log_warn!("auth", "login 2fa required email={login_email}");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": false, "code_required": true })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            store::log_warn!("auth", "login failed email={login_email} error={e}");
+            store_err(e)
+        }
     }
 }
 
@@ -611,14 +708,13 @@ async fn api_logout(Json(req): Json<LogoutReq>) -> Response {
         Err(e) => return store_err(e),
     };
     let _ = ipatool.logout().await; // 吊销失败也继续移除本地记录
-    let mut latest = match store::config::Config::load_or_create() {
-        Ok(config) => config,
-        Err(error) => return store_err(error),
-    };
-    latest.remove_account(&email);
-    if let Err(e) = latest.save() {
+    if let Err(e) = store::config::update(|latest| {
+        latest.remove_account(&email);
+        Ok(())
+    }) {
         return store_err(e);
     }
+    store::log_info!("auth", "logout ok email={email}");
     Json(serde_json::json!({ "ok": true })).into_response()
 }
 
@@ -674,18 +770,24 @@ struct SelectReq {
 }
 
 async fn api_auth_select(Json(req): Json<SelectReq>) -> Response {
-    let mut cfg = match store::config::Config::load_or_create() {
-        Ok(c) => c,
-        Err(e) => return store_err(e),
-    };
-    if !cfg.accounts.iter().any(|a| a.email == req.email) {
-        return err_json(StatusCode::NOT_FOUND, "账号不存在");
+    const NO_SUCH_ACCOUNT: &str = "账号不存在";
+    let result = store::config::update(|cfg| {
+        if !cfg.accounts.iter().any(|a| a.email == req.email) {
+            return Err(store::StoreError::Config(NO_SUCH_ACCOUNT.into()));
+        }
+        cfg.current_account = Some(req.email.clone());
+        Ok(())
+    });
+    match result {
+        Ok(()) => {
+            store::log_info!("auth", "switch account email={}", req.email);
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        Err(store::StoreError::Config(message)) if message == NO_SUCH_ACCOUNT => {
+            err_json(StatusCode::NOT_FOUND, NO_SUCH_ACCOUNT)
+        }
+        Err(e) => store_err(e),
     }
-    cfg.current_account = Some(req.email.clone());
-    if let Err(e) = cfg.save() {
-        return store_err(e);
-    }
-    Json(serde_json::json!({ "ok": true })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -743,12 +845,12 @@ impl VersionsQuery {
     }
 
     fn cache_key(&self) -> String {
+        // 历史版本目录与设备类型无关，不同平台复用同一份缓存
         format!(
-            "{}\0{}\0{}\0{}",
+            "{}\0{}\0{}",
             self.country.to_ascii_uppercase(),
             self.app_id,
-            self.bundle_id,
-            self.platform.ipatool_value(),
+            self.bundle_id
         )
     }
 }
@@ -761,7 +863,7 @@ async fn get_version_catalog(
 ) -> std::result::Result<Arc<store::history::VersionCatalog>, Response> {
     query.validate()?;
     let key = query.cache_key();
-    if let Some(catalog) = state.versions.lock().unwrap().get(&key) {
+    if let Some(catalog) = lock_ignore_poison(&state.versions).get(&key) {
         return Ok(catalog);
     }
 
@@ -780,7 +882,7 @@ async fn get_version_catalog(
         .iter()
         .any(|version| version.release_notes.is_some())
     {
-        state.versions.lock().unwrap().insert(key, catalog.clone());
+        lock_ignore_poison(&state.versions).insert(key, catalog.clone());
     }
     Ok(catalog)
 }
@@ -838,32 +940,39 @@ async fn api_download_start(State(s): State<AppState>, Json(req): Json<DownloadR
         Ok(c) => c,
         Err(e) => return store_err(e),
     };
-    // 下载前真实访问一次商店，立即识别失效会话和 2FA 挑战，避免任务入队后才静默失败。
-    match ipatool.validate_session().await {
-        Ok(session) => {
-            match jobs::spawn_download(
-                s.jobs.clone(),
-                req.bundle_id,
-                req.version_id,
-                req.platform,
-                session.email,
-                ipatool,
-            ) {
-                Ok(reused) => Json(serde_json::json!({
-                    "reused": reused,
-                }))
-                .into_response(),
-                Err(message) => err_json(
-                    if message.starts_with("下载队列已满") {
-                        StatusCode::TOO_MANY_REQUESTS
-                    } else {
-                        StatusCode::BAD_REQUEST
-                    },
-                    message,
-                ),
-            }
-        }
-        Err(e) => store_err(e),
+    let account = cfg
+        .current_meta()
+        .map(|meta| meta.email.clone())
+        .unwrap_or_default();
+    // 会话有效性在任务内校验：ipatool 子进程可能耗时数分钟，
+    // 不阻塞本请求；失效或 2FA 时任务失败，前端轮询到后弹出对应处理。
+    store::log_info!(
+        "download",
+        "requested bundle={} version={} platform={} account={account}",
+        req.bundle_id,
+        req.version_id.as_deref().unwrap_or("latest"),
+        req.platform.ipatool_value()
+    );
+    match jobs::spawn_download(
+        s.jobs.clone(),
+        req.bundle_id,
+        req.version_id,
+        req.platform,
+        account,
+        ipatool,
+    ) {
+        Ok(reused) => Json(serde_json::json!({
+            "reused": reused,
+        }))
+        .into_response(),
+        Err(message) => err_json(
+            if message.starts_with("下载队列已满") {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            message,
+        ),
     }
 }
 
@@ -896,7 +1005,7 @@ async fn artwork_for_file(
     platform: store::search::DevicePlatform,
 ) -> Option<String> {
     let key = format!("{country}\0{}\0{bundle_id}", platform.ipatool_value());
-    if let Some(cached) = state.artwork.lock().unwrap().get(&key) {
+    if let Some(cached) = lock_ignore_poison(&state.artwork).get(&key) {
         return cached;
     }
 
@@ -918,10 +1027,9 @@ async fn artwork_for_file(
             }
         }
     }
-    state.artwork.lock().unwrap().insert(key, artwork.clone());
+    lock_ignore_poison(&state.artwork).insert(key, artwork.clone());
     artwork
 }
-
 async fn api_files(State(state): State<AppState>) -> Response {
     let dir = match store::config::ipas_dir() {
         Ok(d) => d,
@@ -999,8 +1107,14 @@ async fn api_file_delete(State(s): State<AppState>, Path(file): Path<String>) ->
         return err_json(StatusCode::CONFLICT, "该文件正在下载，无法删除");
     }
     match tokio::fs::remove_file(path).await {
-        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
-        Err(error) => err_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        Ok(()) => {
+            store::log_info!("files", "deleted name={file}");
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        Err(error) => {
+            store::log_error!("files", "delete failed name={file} error={error}");
+            err_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+        }
     }
 }
 
@@ -1086,6 +1200,7 @@ async fn api_install(
         return response;
     }
     let token = s.install_tokens.issue(&file);
+    store::log_info!("ota", "install link issued file={file}");
     let install = install_link(&base_url(&s, &headers, &uri), &file, &token);
     Json(serde_json::json!({
         "install": install,
@@ -1107,6 +1222,7 @@ async fn ota_manifest(
         Ok(v) => v,
         Err(r) => return r,
     };
+    store::log_info!("ota", "manifest served file={file}");
     let token = access.token.unwrap_or_default();
     let file_segment = ipadown_ota::url_encode(&file);
     let ipa_url = format!("{}/ota/{file_segment}/app.ipa?token={token}", entry.base);
@@ -1132,6 +1248,7 @@ async fn ota_ipa(
     State(s): State<AppState>,
     Path(file): Path<String>,
     Query(access): Query<OtaAccessQuery>,
+    headers: HeaderMap,
 ) -> Response {
     if !ota_access_allowed(&s, &file, access.token.as_deref()) {
         return err_json(StatusCode::FORBIDDEN, "安装链接无效或已过期，请重新生成");
@@ -1140,16 +1257,161 @@ async fn ota_ipa(
         Ok(p) => p,
         Err(r) => return r,
     };
-    let file = match tokio::fs::File::open(&path).await {
+    let (response, range) = serve_ipa(&path, &headers).await;
+    match range {
+        Some((start, end)) => {
+            store::log_info!(
+                "ota",
+                "ipa served file={file} status=206 range={start}-{end}"
+            )
+        }
+        None => store::log_info!(
+            "ota",
+            "ipa served file={file} status={}",
+            response.status().as_u16()
+        ),
+    }
+    response
+}
+
+/// 提供已下载 IPA：支持 ETag 条件请求（304）与单段 Range（断点续传），
+/// 避免 iOS 安装中断后整包重下。
+async fn serve_ipa(path: &std::path::Path, headers: &HeaderMap) -> (Response, Option<(u64, u64)>) {
+    let mut file = match tokio::fs::File::open(path).await {
         Ok(f) => f,
-        Err(e) => return err_json(StatusCode::NOT_FOUND, e.to_string()),
+        Err(e) => return (err_json(StatusCode::NOT_FOUND, e.to_string()), None),
     };
-    let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-    Response::builder()
+    let metadata = match file.metadata().await {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                None,
+            )
+        }
+    };
+    let len = metadata.len();
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let etag = format!("\"{len:x}-{mtime:x}\"");
+    let last_modified = store::logging::httpdate_from_unix(mtime);
+
+    if let Some(if_none_match) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+    {
+        let matched = if_none_match.split(',').any(|candidate| {
+            let candidate = candidate.trim();
+            candidate == etag || candidate == "*"
+        });
+        if matched {
+            let response = Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header(header::ETAG, etag)
+                .header(header::LAST_MODIFIED, last_modified)
+                .body(Body::empty())
+                .unwrap();
+            return (response, None);
+        }
+    }
+
+    let served_range = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|raw| match parse_range(raw, len) {
+            Ok(range) => range,
+            Err(()) => Some((len, len)), // 不可满足：走 416 分支
+        });
+    let Some((start, end)) = served_range else {
+        // 整包 200（含空文件）
+        let response = Response::builder()
+            .header("Content-Type", "application/octet-stream")
+            .header(header::CONTENT_LENGTH, len.to_string())
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(header::ETAG, etag)
+            .header(header::LAST_MODIFIED, last_modified)
+            .body(Body::from_stream(tokio_util::io::ReaderStream::new(file)))
+            .unwrap();
+        return (response, None);
+    };
+    if start >= len {
+        // 416：告知客户端总长
+        let response = Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::CONTENT_RANGE, format!("bytes */{len}"))
+            .body(Body::empty())
+            .unwrap();
+        return (response, None);
+    }
+    let length = end - start + 1;
+    if start > 0 {
+        if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
+            return (
+                err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                None,
+            );
+        }
+    }
+    let response = Response::builder()
+        .status(StatusCode::PARTIAL_CONTENT)
         .header("Content-Type", "application/octet-stream")
-        .header("Content-Length", len.to_string())
+        .header(header::CONTENT_LENGTH, length.to_string())
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::ETAG, etag)
+        .header(header::LAST_MODIFIED, last_modified)
+        .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))
         .body(Body::from_stream(tokio_util::io::ReaderStream::new(file)))
-        .unwrap()
+        .unwrap();
+    (response, Some((start, end)))
+}
+
+/// 解析单段 `bytes=` Range 头。
+/// - `Ok(Some((start, end)))`：合法区间
+/// - `Ok(None)`：格式不认识或多段请求，回退整包 200
+/// - `Err(())`：语法合法但不可满足（416）
+fn parse_range(raw: &str, len: u64) -> Result<Option<(u64, u64)>, ()> {
+    let Some(spec) = raw.trim().strip_prefix("bytes=") else {
+        return Ok(None);
+    };
+    if spec.contains(',') {
+        return Ok(None);
+    }
+    let Some((start_spec, end_spec)) = spec.split_once('-') else {
+        return Ok(None);
+    };
+    if start_spec.is_empty() {
+        // bytes=-N：最后 N 字节
+        let Ok(suffix) = end_spec.parse::<u64>() else {
+            return Ok(None);
+        };
+        if suffix == 0 || len == 0 {
+            return Err(());
+        }
+        Ok(Some((len.saturating_sub(suffix), len - 1)))
+    } else {
+        let Ok(start) = start_spec.parse::<u64>() else {
+            return Ok(None);
+        };
+        if start >= len {
+            return Err(());
+        }
+        let end = if end_spec.is_empty() {
+            len - 1
+        } else {
+            let Ok(end) = end_spec.parse::<u64>() else {
+                return Ok(None);
+            };
+            end.min(len - 1)
+        };
+        if start > end {
+            return Err(());
+        }
+        Ok(Some((start, end)))
+    }
 }
 
 #[cfg(test)]
@@ -1174,7 +1436,7 @@ mod tests {
         for index in 0..(MAX_INSTALL_TOKENS + 10) {
             tokens.issue(&format!("com.example_{index}.ipa"));
         }
-        assert_eq!(tokens.0.lock().unwrap().len(), MAX_INSTALL_TOKENS);
+        assert_eq!(lock_ignore_poison(&tokens.0).len(), MAX_INSTALL_TOKENS);
     }
 
     #[test]
@@ -1224,7 +1486,7 @@ mod tests {
     #[test]
     fn security_headers_protect_sensitive_responses() {
         let mut response = Response::new(Body::empty());
-        apply_security_headers(&mut response);
+        apply_security_headers(&mut response, "/api/search");
 
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
         assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
@@ -1234,6 +1496,56 @@ mod tests {
             "nosniff"
         );
         assert!(response.headers().contains_key("permissions-policy"));
+    }
+
+    #[test]
+    fn security_headers_apply_strict_csp_without_inline_script() {
+        let mut response = Response::new(Body::empty());
+        apply_security_headers(&mut response, "/");
+
+        let csp = response.headers()[header::CONTENT_SECURITY_POLICY]
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("script-src 'self'"));
+        assert!(!csp.contains("unsafe-eval"));
+        assert!(!csp.contains("script-src 'unsafe-inline'"));
+    }
+
+    #[test]
+    fn cache_policy_follows_the_request_path() {
+        for (path, expected) in [
+            ("/api/search", "no-store"),
+            ("/", "no-cache"),
+            ("/app.js", "no-cache"),
+            ("/ota/a.ipa/app.ipa", "private, max-age=0, must-revalidate"),
+        ] {
+            let mut response = Response::new(Body::empty());
+            apply_security_headers(&mut response, path);
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                expected,
+                "path {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn range_parser_handles_single_suffix_and_open_ranges() {
+        assert_eq!(parse_range("bytes=0-", 100), Ok(Some((0, 99))));
+        assert_eq!(parse_range("bytes=0-0", 100), Ok(Some((0, 0))));
+        assert_eq!(parse_range("bytes=10-20", 100), Ok(Some((10, 20))));
+        assert_eq!(parse_range("bytes=10-", 100), Ok(Some((10, 99))));
+        assert_eq!(parse_range("bytes=-10", 100), Ok(Some((90, 99))));
+        // 结尾越界按总长截断
+        assert_eq!(parse_range("bytes=90-200", 100), Ok(Some((90, 99))));
+        // 不可满足
+        assert_eq!(parse_range("bytes=100-", 100), Err(()));
+        assert_eq!(parse_range("bytes=-0", 100), Err(()));
+        assert_eq!(parse_range("bytes=5-2", 100), Err(()));
+        // 无法处理（回退整包 200）
+        assert_eq!(parse_range("bytes=0-10,20-30", 100), Ok(None));
+        assert_eq!(parse_range("octets=0-10", 100), Ok(None));
+        assert_eq!(parse_range("garbage", 100), Ok(None));
     }
 
     #[test]
@@ -1267,22 +1579,56 @@ mod tests {
     }
 
     #[test]
+    fn frontend_uses_no_inline_event_handlers() {
+        // HTML 属性形态的内联处理器（onclick="…" 等）一律不允许；
+        // JS 属性赋值（el.onclick = fn）不受 CSP 限制，属于正常写法。
+        assert!(!INDEX_HTML.contains("onclick="));
+        assert!(!INDEX_HTML.contains("onkeydown="));
+        assert!(!INDEX_HTML.contains("onerror="));
+        for pattern in ["onclick=\"", "onclick='", "onkeydown=\"", "onerror=\""] {
+            assert!(!APP_JS.contains(pattern), "inline handler {pattern} found");
+        }
+        assert!(INDEX_HTML.contains("<script src=\"/app.js\"></script>"));
+    }
+
+    #[test]
+    fn every_data_act_has_a_registered_action() {
+        let mut used: Vec<&str> = Vec::new();
+        for source in [INDEX_HTML, APP_JS] {
+            let mut rest = source;
+            while let Some(index) = rest.find("data-act=\"") {
+                rest = &rest[index + "data-act=\"".len()..];
+                let end = rest.find('"').unwrap();
+                used.push(&rest[..end]);
+            }
+        }
+        assert!(!used.is_empty());
+        for act in used {
+            assert!(
+                APP_JS.contains(&format!("'{act}':")),
+                "no ACTIONS entry for data-act=\"{act}\"",
+            );
+        }
+    }
+
+    #[test]
     fn frontend_browser_gate_shows_and_copies_the_current_app_address() {
         assert!(INDEX_HTML.contains("id=\"safari-address\""));
         assert!(INDEX_HTML.contains("id=\"copy-safari-address\""));
-        assert!(INDEX_HTML.contains("resolvedSafariAddress=location.origin"));
-        assert!(INDEX_HTML.contains("config.public_base_url"));
-        assert!(INDEX_HTML.contains("const address=await safariAddressPromise"));
-        assert!(INDEX_HTML.contains("navigator.clipboard?.writeText"));
-        assert!(INDEX_HTML.contains("document.execCommand('copy')"));
-        assert!(!INDEX_HTML.contains("subdomain.微服名.heiyu.space"));
+        assert!(APP_JS.contains("resolvedSafariAddress=location.origin"));
+        assert!(APP_JS.contains("config.public_base_url"));
+        assert!(APP_JS.contains("const address=await safariAddressPromise"));
+        assert!(APP_JS.contains("navigator.clipboard?.writeText"));
+        assert!(APP_JS.contains("document.execCommand('copy')"));
+        assert!(!APP_JS.contains("subdomain.微服名.heiyu.space"));
     }
 
     #[test]
     fn frontend_downloaded_files_use_compact_rows_with_artwork() {
-        assert!(INDEX_HTML.contains("class=\"file-row\""));
-        assert!(INDEX_HTML.contains("file.artwork_url"));
-        assert!(INDEX_HTML.contains("platformLabel(file.platform)"));
+        assert!(INDEX_HTML.contains(".file-row"));
+        assert!(APP_JS.contains("class=\"file-row\""));
+        assert!(APP_JS.contains("file.artwork_url"));
+        assert!(APP_JS.contains("platformLabel(file.platform)"));
         assert!(!INDEX_HTML.contains("responsive-table"));
     }
 
@@ -1302,9 +1648,9 @@ mod tests {
 
     #[test]
     fn frontend_prompts_for_two_factor_and_uses_three_tab_navigation() {
-        assert!(INDEX_HTML.contains("error.codeRequired"));
-        assert!(INDEX_HTML.contains("job.needs_2fa"));
-        assert!(INDEX_HTML.contains("openLoginModal(true,challenge.account"));
+        assert!(APP_JS.contains("error.codeRequired"));
+        assert!(APP_JS.contains("job.needs_2fa"));
+        assert!(APP_JS.contains("openLoginModal(true,challenge.account"));
 
         let header = INDEX_HTML.split("</header>").next().unwrap();
         assert!(!header.contains("account-trigger"));
@@ -1337,55 +1683,55 @@ mod tests {
             .next()
             .unwrap();
         assert!(!search_panel.contains("data-platform="));
-        assert!(INDEX_HTML.contains("&platform=${encodeURIComponent(platform)}"));
-        assert!(INDEX_HTML.contains(
+        assert!(APP_JS.contains("&platform=${encodeURIComponent(platform)}"));
+        assert!(APP_JS.contains(
             "body:JSON.stringify({bundle_id:bundleId,version_id:versionId || undefined,platform})"
         ));
-        assert!(INDEX_HTML.contains("pendingDownload={bundleId,versionId,platform}"));
+        assert!(APP_JS.contains("pendingDownload={bundleId,versionId,platform}"));
     }
 
     #[test]
     fn frontend_versions_open_details_and_load_on_scroll_without_filters_or_pages() {
-        assert!(INDEX_HTML.contains("function showVersionDetail"));
-        assert!(INDEX_HTML.contains("IntersectionObserver"));
-        assert!(INDEX_HTML.contains("VERSION_BATCH_SIZE=20"));
-        assert!(INDEX_HTML.contains("(result.versions || []).map"));
-        assert!(!INDEX_HTML.contains("result.ids"));
-        assert!(!INDEX_HTML.contains("class=\"filters\""));
-        assert!(!INDEX_HTML.contains("function pageWindow"));
+        assert!(APP_JS.contains("function showVersionDetail"));
+        assert!(APP_JS.contains("IntersectionObserver"));
+        assert!(APP_JS.contains("VERSION_BATCH_SIZE=20"));
+        assert!(APP_JS.contains("(result.versions || []).map"));
+        assert!(!APP_JS.contains("result.ids"));
+        assert!(!APP_JS.contains("class=\"filters\""));
+        assert!(!APP_JS.contains("function pageWindow"));
 
-        let list_renderer = INDEX_HTML
+        let list_renderer = APP_JS
             .split("function versionItemHtml")
             .nth(1)
             .unwrap()
             .split("function stopVersionObserver")
             .next()
             .unwrap();
-        assert!(!list_renderer.contains("startDownload"));
+        assert!(!list_renderer.contains("start-download"));
 
-        let detail_renderer = INDEX_HTML
+        let detail_renderer = APP_JS
             .split("function showVersionDetail")
             .nth(1)
             .unwrap()
             .split("function backToVersionList")
             .next()
             .unwrap();
-        assert!(detail_renderer.contains("startDownload"));
+        assert!(detail_renderer.contains("data-act=\"start-download\""));
         assert!(detail_renderer.contains("entry.release_notes"));
         assert!(detail_renderer.contains("更新日志"));
-        assert!(INDEX_HTML.contains("function versionDetailIsOpen()"));
-        assert!(INDEX_HTML
+        assert!(APP_JS.contains("function versionDetailIsOpen()"));
+        assert!(APP_JS
             .contains("if (!force && versionDetailIsOpen()) { backToVersionList(); return; }"));
-        assert!(INDEX_HTML.contains("closeModal(true); showTab('download')"));
+        assert!(APP_JS.contains("closeModal(true); showTab('download')"));
     }
 
     #[test]
     fn frontend_escapes_inline_arguments_and_ignores_stale_requests() {
-        assert!(INDEX_HTML.contains("replace(/'/g,'%27')"));
-        assert!(INDEX_HTML.contains("let searchRequestId=0"));
-        assert!(INDEX_HTML.contains("let versionRequestId=0"));
-        assert!(INDEX_HTML.contains("if (requestId!==searchRequestId)"));
-        assert!(INDEX_HTML.contains("if (requestId!==versionRequestId) return"));
+        assert!(APP_JS.contains("replace(/'/g,'%27')"));
+        assert!(APP_JS.contains("let searchRequestId=0"));
+        assert!(APP_JS.contains("let versionRequestId=0"));
+        assert!(APP_JS.contains("if (requestId!==searchRequestId)"));
+        assert!(APP_JS.contains("if (requestId!==versionRequestId) return"));
     }
 
     #[test]
@@ -1395,8 +1741,8 @@ mod tests {
         assert!(INDEX_HTML.contains("position:absolute; top:17px; right:17px;"));
         assert!(INDEX_HTML.contains(".modal .close { top:14px; right:12px; }"));
         assert!(!INDEX_HTML.contains("margin:0 0 -30px auto"));
-        assert!(INDEX_HTML.contains("class=\"login-form\""));
-        assert!(INDEX_HTML.contains("</div>`,false,true);"));
+        assert!(APP_JS.contains("class=\"login-form\""));
+        assert!(APP_JS.contains("</div>`,false,true);"));
         assert!(!INDEX_HTML.contains("float:right"));
         assert!(!INDEX_HTML.contains("历史版本 · Safari 直接安装"));
         assert!(!INDEX_HTML.contains("新到旧 ·"));
@@ -1417,9 +1763,9 @@ mod tests {
 
     #[test]
     fn frontend_refreshes_files_on_changes_instead_of_continuous_polling() {
-        assert!(INDEX_HTML.contains("function keepJobsUpdated"));
-        assert!(INDEX_HTML.contains("completedJobIds"));
-        assert!(!INDEX_HTML.contains("setInterval(refreshFiles"));
+        assert!(APP_JS.contains("function keepJobsUpdated"));
+        assert!(APP_JS.contains("completedJobIds"));
+        assert!(!APP_JS.contains("setInterval(refreshFiles"));
     }
 
     #[test]
@@ -1439,22 +1785,22 @@ mod tests {
 
     #[test]
     fn frontend_modal_locks_ios_page_scroll_and_guards_scroll_edges() {
-        assert!(INDEX_HTML.contains("function lockPageScroll()"));
-        assert!(INDEX_HTML.contains("function unlockPageScroll()"));
-        assert!(INDEX_HTML.contains("lockPageScroll();"));
-        assert!(INDEX_HTML.contains("unlockPageScroll();"));
-        assert!(INDEX_HTML.contains("function guardModalTouchMove"));
-        assert!(INDEX_HTML.contains("{passive:false}"));
+        assert!(APP_JS.contains("function lockPageScroll()"));
+        assert!(APP_JS.contains("function unlockPageScroll()"));
+        assert!(APP_JS.contains("lockPageScroll();"));
+        assert!(APP_JS.contains("unlockPageScroll();"));
+        assert!(APP_JS.contains("function guardModalTouchMove"));
+        assert!(APP_JS.contains("{passive:false}"));
     }
 
     #[test]
     fn frontend_download_gives_immediate_progress_feedback() {
-        assert!(INDEX_HTML.contains("id=\"download-feedback\""));
-        assert!(INDEX_HTML.contains("aria-busy"));
-        assert!(INDEX_HTML.contains("class=\"button-spinner\""));
-        assert!(INDEX_HTML.contains("正在验证 Apple ID 并创建下载任务"));
+        assert!(APP_JS.contains("id=\"download-feedback\""));
+        assert!(APP_JS.contains("aria-busy"));
+        assert!(APP_JS.contains("class=\"button-spinner\""));
+        assert!(APP_JS.contains("正在创建下载任务，请稍候…"));
 
-        let start_download = INDEX_HTML
+        let start_download = APP_JS
             .split("async function startDownload")
             .nth(1)
             .unwrap()
@@ -1470,13 +1816,13 @@ mod tests {
     #[test]
     fn frontend_desktop_debug_unlock_requires_five_silent_icon_clicks() {
         assert!(INDEX_HTML.contains("id=\"browser-gate-icon\""));
-        assert!(INDEX_HTML.contains("function isDesktopBrowser()"));
-        assert!(INDEX_HTML.contains("function handleDesktopDebugClick()"));
-        assert!(INDEX_HTML.contains("desktopDebugClicks < 5"));
-        assert!(INDEX_HTML.contains("sessionStorage"));
+        assert!(APP_JS.contains("function isDesktopBrowser()"));
+        assert!(APP_JS.contains("function handleDesktopDebugClick()"));
+        assert!(APP_JS.contains("desktopDebugClicks < 5"));
+        assert!(APP_JS.contains("sessionStorage"));
         assert!(INDEX_HTML.contains("id=\"desktop-debug-banner\""));
 
-        let before_unlock = INDEX_HTML
+        let before_unlock = APP_JS
             .split("function handleDesktopDebugClick()")
             .nth(1)
             .unwrap()

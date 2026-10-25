@@ -4,6 +4,10 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
+use std::sync::Mutex;
+
+/// 串行化 config.json 的「加载→修改→保存」，避免并发请求互相覆盖。
+static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 
 /// 模拟 Apple Configurator 2 的 User-Agent（与 ApplePackage 保持一致）
 pub const USER_AGENT: &str =
@@ -80,6 +84,18 @@ fn random_hex<const N: usize>() -> String {
     let mut bytes = [0u8; N];
     getrandom::fill(&mut bytes).expect("无法从操作系统获取安全随机数");
     bytes.iter().map(|b| format!("{b:02X}")).collect()
+}
+
+/// 原子的读-改-写：在锁内重新加载最新配置，应用修改并落盘。
+/// 修改返回 Err 时不会写入（用于校验失败等场景）。
+pub fn update<T>(mutate: impl FnOnce(&mut Config) -> Result<T>) -> Result<T> {
+    let _guard = CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut cfg = Config::load_or_create()?;
+    let outcome = mutate(&mut cfg)?;
+    cfg.save()?;
+    Ok(outcome)
 }
 
 impl Config {

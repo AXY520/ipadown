@@ -83,6 +83,14 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// 锁中毒时数据仍完整，取回继续而不是连环 panic。
+fn jobs_map(registry: &Registry) -> std::sync::MutexGuard<'_, HashMap<String, Job>> {
+    registry
+        .jobs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub(super) fn download_filename(
     bundle_id: &str,
     version_id: Option<&str>,
@@ -114,7 +122,7 @@ pub(super) fn download_filename(
 }
 
 pub(super) fn list(reg: &Registry) -> Vec<Job> {
-    let reg = reg.jobs.lock().unwrap();
+    let reg = jobs_map(reg);
     let mut jobs: Vec<Job> = reg.values().cloned().collect();
     jobs.sort_by(|a, b| {
         b.created_at
@@ -126,7 +134,7 @@ pub(super) fn list(reg: &Registry) -> Vec<Job> {
 
 /// 账号重新认证成功后，移除该账号此前因 2FA 失败的任务。
 pub(super) fn clear_two_factor_failures(reg: &Registry, account: &str) -> usize {
-    let mut jobs = reg.jobs.lock().unwrap();
+    let mut jobs = jobs_map(reg);
     let before = jobs.len();
     jobs.retain(|_, job| {
         !(job.needs_2fa && job.status == "error" && job.account.eq_ignore_ascii_case(account))
@@ -135,7 +143,7 @@ pub(super) fn clear_two_factor_failures(reg: &Registry, account: &str) -> usize 
 }
 
 pub(super) fn is_file_active(reg: &Registry, filename: &str) -> bool {
-    reg.jobs.lock().unwrap().values().any(|job| {
+    jobs_map(reg).values().any(|job| {
         matches!(job.status.as_str(), "queued" | "downloading")
             && download_filename(&job.bundle_id, job.version_id.as_deref(), job.platform).as_deref()
                 == Ok(filename)
@@ -144,7 +152,7 @@ pub(super) fn is_file_active(reg: &Registry, filename: &str) -> bool {
 
 fn prune_finished(reg: &Registry) {
     const MAX_FINISHED_JOBS: usize = 100;
-    let mut reg = reg.jobs.lock().unwrap();
+    let mut reg = jobs_map(reg);
     let mut finished: Vec<(u64, String)> = reg
         .values()
         .filter(|job| matches!(job.status.as_str(), "done" | "error"))
@@ -161,7 +169,7 @@ fn prune_finished(reg: &Registry) {
 }
 
 fn update(reg: &Registry, id: &str, f: impl FnOnce(&mut Job)) {
-    if let Some(job) = reg.jobs.lock().unwrap().get_mut(id) {
+    if let Some(job) = jobs_map(reg).get_mut(id) {
         f(job);
     }
 }
@@ -175,7 +183,7 @@ fn reserve_job(
     platform: store::search::DevicePlatform,
     account_email: &str,
 ) -> Result<Option<String>, &'static str> {
-    let mut jobs = reg.jobs.lock().unwrap();
+    let mut jobs = jobs_map(reg);
     if jobs.values().any(|job| {
         job.bundle_id == bundle_id
             && job.version_id.as_deref() == version_id
@@ -235,6 +243,12 @@ pub(super) fn spawn_download(
                 )
                 .await
                 {
+                    store::log_error!(
+                        "download",
+                        "job failed id={task_id} bundle={bundle_id} version={} platform={} error={e}",
+                        version_id.as_deref().unwrap_or("latest"),
+                        platform.ipatool_value()
+                    );
                     update(&reg, &task_id, |job| job.record_failure(&e));
                 }
             }
@@ -258,6 +272,16 @@ async fn run_download(
     filename: String,
     ipatool: store::ipatool::Ipatool,
 ) -> store::Result<()> {
+    let started = std::time::Instant::now();
+    store::log_info!(
+        "download",
+        "job started id={id} bundle={bundle_id} version={} platform={} file={filename}",
+        version_id.unwrap_or("latest"),
+        platform.ipatool_value()
+    );
+    // 入队前同步校验会话（auth info + 真实商店请求），失败/2FA 直接让任务失败，
+    // 前端轮询 needs_2fa 后弹验证码对话框。
+    ipatool.validate_session().await?;
     // 用公开搜索 API 补充应用名（多区依次尝试）
     for country in ["CN", "US", "JP"] {
         if let Ok(app) = store::search::lookup(bundle_id, country, platform).await {
@@ -295,10 +319,16 @@ async fn run_download(
     watcher.abort();
     result?;
 
+    let size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
     update(reg, id, |j| {
         j.status = "done".into();
-        j.downloaded = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
+        j.downloaded = size;
     });
+    store::log_info!(
+        "download",
+        "job done id={id} bundle={bundle_id} file={filename} size={size} elapsed={}s",
+        started.elapsed().as_secs()
+    );
     Ok(())
 }
 

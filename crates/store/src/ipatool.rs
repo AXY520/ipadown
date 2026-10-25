@@ -59,6 +59,11 @@ impl Ipatool {
             attempt += 1;
             match self.run_once(args).await {
                 Err(StoreError::AuthFailed(msg)) if is_network_error(&msg) && attempt < 3 => {
+                    crate::log_warn!(
+                        "ipatool",
+                        "network error, retrying cmd={:?} attempt={attempt} error={msg}",
+                        log_argv(args)
+                    );
                     tokio::time::sleep(std::time::Duration::from_secs(u64::from(attempt) * 2))
                         .await;
                     continue;
@@ -70,6 +75,7 @@ impl Ipatool {
 
     /// 运行 ipatool 子命令，返回最后一行 JSON（约 10 分钟超时，首次登录需下载并模拟 storeagent）
     async fn run_once(&self, args: &[&str]) -> Result<serde_json::Value> {
+        let started = std::time::Instant::now();
         let mut cmd = Command::new(IPATOOL_BIN);
         cmd.args(args)
             .args(self.base_args())
@@ -86,6 +92,17 @@ impl Ipatool {
                 }
                 Err(_) => return Err(StoreError::UnexpectedResponse("ipatool 执行超时".into())),
             };
+        let elapsed_ms = started.elapsed().as_millis();
+        let argv = log_argv(args);
+        if output.status.success() {
+            crate::log_info!("ipatool", "ok cmd={argv} dur={elapsed_ms}ms");
+        } else {
+            crate::log_warn!(
+                "ipatool",
+                "failed cmd={argv} exit={} dur={elapsed_ms}ms",
+                output.status.code().unwrap_or(-1)
+            );
+        }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -94,6 +111,7 @@ impl Ipatool {
         // 见 ipatool cmd/auth.go：打印后直接 return nil），必须全文检测
         let combined = format!("{stdout}\n{stderr}").to_lowercase();
         if combined.contains("2fa code is required") || combined.contains("--auth-code") {
+            crate::log_warn!("ipatool", "2fa challenge cmd={argv}");
             return Err(StoreError::CodeRequired);
         }
 
@@ -133,6 +151,7 @@ impl Ipatool {
                 let tail = combined.chars().take(200).collect::<String>();
                 format!("ipatool 输出无法解析: {tail}")
             });
+        crate::log_error!("ipatool", "error cmd={argv} msg={msg}");
         let lower = msg.to_lowercase();
         if lower.contains("2fa") || lower.contains("auth code") || lower.contains("verification") {
             return Err(StoreError::CodeRequired);
@@ -235,6 +254,24 @@ impl Ipatool {
 }
 
 // ---------- 多账号辅助 ----------
+
+/// 用于日志的参数列表：密码（-p 后面的值）打码，其余原样。
+fn log_argv(args: &[&str]) -> String {
+    let mut redacted = Vec::with_capacity(args.len());
+    let mut hide_next = false;
+    for arg in args {
+        if hide_next {
+            redacted.push("***");
+            hide_next = false;
+        } else if *arg == "-p" {
+            redacted.push(arg);
+            hide_next = true;
+        } else {
+            redacted.push(arg);
+        }
+    }
+    redacted.join(" ")
+}
 
 /// 解密钥匙串 JWE，读取账号元数据（邮箱/姓名/storeFront→国家）
 pub fn read_account_meta(cfg: &Config, email: &str) -> Option<AccountMeta> {

@@ -35,11 +35,25 @@ compose 使用普通 bridge 网络，映射 `8080:8080`。安装前需用受信 
 
 数据（账号会话 + 下载的 IPA）持久化在 `./data` 卷。
 
+### 容器日志
+
+应用日志与操作日志全部写入容器 stdout/stderr（`docker logs` 或懒猫应用日志直接可看）：
+
+- `http`：请求方法、路径、状态码、耗时（前端轮询端点只在出错时记录）
+- `auth`：登录/登出/切换账号，含 2FA 挑战
+- `download`：任务入队、开始、完成（大小/耗时）、失败原因
+- `ipatool`：子进程命令（密码打码）、耗时、退出码、错误信息、网络重试
+- `ota`：安装令牌发放、manifest/IPA 分发（含 Range）
+- `history` / `files` / `startup` / `shutdown`：历史版本拉取、文件删除、启动与停止
+
+排查下载失败时优先看 `download` 与 `ipatool` 两类日志。
+
 ### 环境变量
 
 | 变量 | 必填 | 说明 |
 |---|---|---|
-| `PUBLIC_BASE_URL` | 域名安装必填 | 对外受信 HTTPS 地址，如 `https://ipa.example.com` |
+| `PUBLIC_BASE_URL` | 域名安装必填 | 对外受信 HTTPS 地址，如 `https://ipa.example.com`；未设置时按 Host 头推导 |
+| `IPADOWN_TRUST_PROXY` | 反代部署建议设置 | 设为 `1` 时信任 `X-Forwarded-Host/Proto` 头推导安装链接；仅在自家反向代理后开启，避免伪造头注入安装链接 |
 | `PORT` | 否 | 主服务端口（Web/API），默认 `8080` |
 | `IPADOWN_DATA_DIR` | 否 | 数据目录，默认 `/data` |
 | `IPADOWN_WEB_USERNAME` | 否 | Docker Web/API Basic Auth 用户名，默认 `ipadown` |
