@@ -721,7 +721,7 @@ async function refreshFiles() {
   box.innerHTML=`<div class="list-summary">${list.length} 个文件 · ${fmtSize(list.reduce((sum,file)=>sum+file.size,0))}</div><div class="file-list">`+
     list.map(file => `<div class="swipe-row" data-name="${arg(file.name)}"><button type="button" class="swipe-action" data-act="delete-file" data-name="${arg(file.name)}">删除</button>
       <div class="swipe-content"><div class="file-row"><div class="file-icon">${file.artwork_url ? `<img src="${esc(file.artwork_url)}" loading="lazy" alt="">` : '↓'}</div>
-      <div class="file-info" title="${esc(file.name)}"><div class="file-title">${esc(file.title||file.bundle_id||file.name)}</div><div class="file-meta">${platformLabel(file.platform)} · ${esc(file.version||'版本未知')} · ${fmtSize(file.size)}</div></div></div></div>`).join('')+'</div>';
+      <div class="file-info" title="${esc(file.name)}"><div class="file-title">${esc(file.title||file.bundle_id||file.name)}</div><div class="file-meta">${platformLabel(file.platform)} · ${esc(file.version||'版本未知')} · ${fmtSize(file.size)}</div></div></div></div></div>`).join('')+'</div>';
   box.querySelectorAll('.swipe-row').forEach(row => makeSwipeable(row, () => installFile(decodeURIComponent(row.dataset.name),null)));
 }
 async function installFile(name,button=null) {

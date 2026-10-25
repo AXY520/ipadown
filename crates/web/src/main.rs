@@ -1707,6 +1707,8 @@ mod tests {
         assert!(APP_JS.contains(
             "makeSwipeable(row, () => installFile(decodeURIComponent(row.dataset.name),null))"
         ));
+        // swipe-row 必须在模板内闭合，否则下一行嵌套进来、删除按钮会盖住多行
+        assert!(APP_JS.contains("</div></div></div></div>`).join('')"));
         // 进度轮询改为行内更新，避免滑动手势被重绘打断
         assert!(APP_JS.contains("function buildJobRow("));
         assert!(APP_JS.contains("function updateJobRow("));
