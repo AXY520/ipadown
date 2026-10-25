@@ -1,0 +1,1489 @@
+mod jobs;
+
+use axum::{
+    body::Body,
+    extract::{Path, Query, Request, State},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Response},
+    Json, Router,
+};
+use base64::Engine;
+use ipadown_store as store;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const INDEX_HTML: &str = include_str!("../static/index.html");
+
+/// 历史版本目录与 App Store 更新日志缓存有效期。
+const HISTORY_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+const INSTALL_TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
+const MAX_HISTORY_CACHE_ENTRIES: usize = 64;
+const MAX_INSTALL_TOKENS: usize = 128;
+const ARTWORK_CACHE_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+const MAX_ARTWORK_CACHE_ENTRIES: usize = 256;
+const DEFAULT_MIN_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+#[derive(Default)]
+struct VersionsCache {
+    /// "country\0app_id\0bundle_id\0platform" -> 历史版本目录
+    catalogs: HashMap<String, (Instant, Arc<store::history::VersionCatalog>)>,
+}
+
+impl VersionsCache {
+    fn get(&mut self, key: &str) -> Option<Arc<store::history::VersionCatalog>> {
+        self.catalogs
+            .retain(|_, (created_at, _)| created_at.elapsed() < HISTORY_CACHE_TTL);
+        self.catalogs.get(key).map(|(_, catalog)| catalog.clone())
+    }
+
+    fn insert(&mut self, key: String, catalog: Arc<store::history::VersionCatalog>) {
+        self.catalogs
+            .retain(|_, (created_at, _)| created_at.elapsed() < HISTORY_CACHE_TTL);
+        if self.catalogs.len() >= MAX_HISTORY_CACHE_ENTRIES {
+            let oldest = self
+                .catalogs
+                .iter()
+                .min_by_key(|(_, (created_at, _))| *created_at)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.catalogs.remove(&oldest);
+            }
+        }
+        self.catalogs.insert(key, (Instant::now(), catalog));
+    }
+}
+
+#[derive(Default)]
+struct ArtworkCache {
+    /// "country\0platform\0bundle_id" -> App Store 图标；None 也会缓存，避免反复查询已下架应用。
+    entries: HashMap<String, (Instant, Option<String>)>,
+}
+
+impl ArtworkCache {
+    fn get(&mut self, key: &str) -> Option<Option<String>> {
+        self.entries
+            .retain(|_, (created_at, _)| created_at.elapsed() < ARTWORK_CACHE_TTL);
+        self.entries.get(key).map(|(_, url)| url.clone())
+    }
+
+    fn insert(&mut self, key: String, url: Option<String>) {
+        self.entries
+            .retain(|_, (created_at, _)| created_at.elapsed() < ARTWORK_CACHE_TTL);
+        if self.entries.len() >= MAX_ARTWORK_CACHE_ENTRIES {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (created_at, _))| *created_at)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(key, (Instant::now(), url));
+    }
+}
+
+#[derive(Clone)]
+struct AppState {
+    public_base_url: Option<String>,
+    jobs: jobs::Registry,
+    versions: Arc<Mutex<VersionsCache>>,
+    artwork: Arc<Mutex<ArtworkCache>>,
+    install_tokens: InstallTokens,
+}
+
+#[derive(Clone, Default)]
+struct InstallTokens(Arc<Mutex<HashMap<String, InstallGrant>>>);
+
+struct InstallGrant {
+    file: String,
+    expires_at: Instant,
+}
+
+impl InstallTokens {
+    fn issue(&self, file: &str) -> String {
+        let token = random_id();
+        let mut grants = self.0.lock().unwrap();
+        let now = Instant::now();
+        grants.retain(|_, grant| grant.expires_at > now);
+        if grants.len() >= MAX_INSTALL_TOKENS {
+            let earliest = grants
+                .iter()
+                .min_by_key(|(_, grant)| grant.expires_at)
+                .map(|(token, _)| token.clone());
+            if let Some(earliest) = earliest {
+                grants.remove(&earliest);
+            }
+        }
+        grants.insert(
+            token.clone(),
+            InstallGrant {
+                file: file.to_string(),
+                expires_at: now + INSTALL_TOKEN_TTL,
+            },
+        );
+        token
+    }
+
+    fn allows(&self, token: &str, file: &str) -> bool {
+        let mut grants = self.0.lock().unwrap();
+        grants.retain(|_, grant| grant.expires_at > Instant::now());
+        grants.get(token).is_some_and(|grant| grant.file == file)
+    }
+}
+
+fn random_id() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("无法从操作系统获取安全随机数");
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[derive(Clone)]
+struct BasicAuth {
+    username: String,
+    password: String,
+}
+
+impl BasicAuth {
+    fn from_env() -> Option<Self> {
+        let password = std::env::var("IPADOWN_WEB_PASSWORD")
+            .ok()
+            .filter(|value| !value.is_empty())?;
+        Some(Self {
+            username: std::env::var("IPADOWN_WEB_USERNAME")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "ipadown".into()),
+            password,
+        })
+    }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut diff = left.len() ^ right.len();
+    for index in 0..left.len().max(right.len()) {
+        diff |= usize::from(
+            left.get(index).copied().unwrap_or(0) ^ right.get(index).copied().unwrap_or(0),
+        );
+    }
+    diff == 0
+}
+
+async fn require_basic_auth(
+    State(auth): State<BasicAuth>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let valid = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Basic "))
+        .and_then(|encoded| {
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()
+        })
+        .and_then(|decoded| String::from_utf8(decoded).ok())
+        .and_then(|decoded| {
+            let (username, password) = decoded.split_once(':')?;
+            Some(
+                constant_time_eq(username.as_bytes(), auth.username.as_bytes())
+                    && constant_time_eq(password.as_bytes(), auth.password.as_bytes()),
+            )
+        })
+        .unwrap_or(false);
+
+    if valid {
+        next.run(request).await
+    } else {
+        Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(
+                header::WWW_AUTHENTICATE,
+                "Basic realm=\"ipadown\", charset=\"UTF-8\"",
+            )
+            .body(Body::from("需要访问密码"))
+            .unwrap()
+    }
+}
+
+fn apply_security_headers(response: &mut Response) {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+    );
+}
+
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    apply_security_headers(&mut response);
+    response
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            eprintln!("无法监听 Ctrl+C: {error}");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => eprintln!("无法监听 SIGTERM: {error}"),
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
+    println!("收到退出信号，正在停止服务…");
+}
+
+async fn wait_for_shutdown(mut receiver: tokio::sync::watch::Receiver<bool>) {
+    if *receiver.borrow() {
+        return;
+    }
+    while receiver.changed().await.is_ok() {
+        if *receiver.borrow() {
+            return;
+        }
+    }
+}
+
+fn arm_tls_shutdown(
+    handle: axum_server::Handle<SocketAddr>,
+    receiver: tokio::sync::watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        wait_for_shutdown(receiver).await;
+        handle.graceful_shutdown(Some(Duration::from_secs(10)));
+    });
+}
+
+#[tokio::main]
+async fn main() {
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_sender.send(true);
+    });
+
+    // 启动时固化配置（确保 keychain_passphrase 等字段落盘，避免每次启动重新生成）
+    match store::config::Config::load_or_create() {
+        Ok(mut cfg) => store::ipatool::migrate_legacy(&mut cfg),
+        Err(e) => eprintln!("配置初始化失败: {e}"),
+    }
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8080);
+    let public_base_url = std::env::var("PUBLIC_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim_end_matches('/').to_string());
+
+    let state = AppState {
+        public_base_url,
+        jobs: jobs::new_registry(),
+        versions: Arc::new(Mutex::new(VersionsCache::default())),
+        artwork: Arc::new(Mutex::new(ArtworkCache::default())),
+        install_tokens: InstallTokens::default(),
+    };
+
+    let protected = Router::new()
+        .route("/", axum::routing::get(|| async { Html(INDEX_HTML) }))
+        .route("/api/config", axum::routing::get(api_config))
+        .route("/api/auth/login", axum::routing::post(api_login))
+        .route("/api/auth/logout", axum::routing::post(api_logout))
+        .route("/api/auth/accounts", axum::routing::get(api_accounts))
+        .route("/api/auth/refresh", axum::routing::post(api_auth_refresh))
+        .route("/api/auth/select", axum::routing::post(api_auth_select))
+        .route("/api/search", axum::routing::get(api_search))
+        .route("/api/versions", axum::routing::get(api_versions))
+        .route(
+            "/api/downloads",
+            axum::routing::get(api_downloads).post(api_download_start),
+        )
+        .route("/api/files", axum::routing::get(api_files))
+        .route("/api/files/{file}", axum::routing::delete(api_file_delete))
+        .route("/api/install/{file}", axum::routing::get(api_install));
+    let basic_auth = BasicAuth::from_env();
+    let protected = match basic_auth {
+        Some(auth) => protected.layer(middleware::from_fn_with_state(auth, require_basic_auth)),
+        None => {
+            if std::env::var_os("IPADOWN_PLATFORM_AUTH").is_none() {
+                eprintln!("警告: 未设置 IPADOWN_WEB_PASSWORD，Web/API 仅应暴露在可信网络中");
+            }
+            protected
+        }
+    };
+    let ota_routes = Router::new()
+        .route("/healthz", axum::routing::get(|| async { "ok" }))
+        .route(
+            "/ota/{file}/manifest.plist",
+            axum::routing::get(ota_manifest),
+        )
+        .route("/ota/{file}/app.ipa", axum::routing::get(ota_ipa));
+    let app = ota_routes
+        .merge(protected)
+        .layer(middleware::from_fn(security_headers))
+        .with_state(state.clone());
+
+    // 双栈监听：优先 [::]（Linux 下同时接受 IPv4/IPv6，兼容 lazycat ingress 走 ::1 的回源）
+    let addr_v6 = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port));
+    let addr_v4 = SocketAddr::from(([0, 0, 0, 0], port));
+    let tls_cert = std::env::var("TLS_CERT").ok();
+    let tls_key = std::env::var("TLS_KEY").ok();
+
+    match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => {
+            let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+                .await
+                .expect("TLS 证书加载失败");
+            println!("ipadown-web 已启动 (HTTPS): https://[::]:{port}");
+            let handle = axum_server::Handle::new();
+            arm_tls_shutdown(handle.clone(), shutdown_receiver);
+            if let Err(error) = axum_server::bind_rustls(addr_v6, tls)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await
+            {
+                eprintln!("HTTPS 服务异常退出: {error}");
+            }
+        }
+        _ => {
+            println!("ipadown-web 已启动 (HTTP): http://[::]:{port}");
+            if state.public_base_url.is_none() {
+                println!("提示: 未设置 PUBLIC_BASE_URL，浏览器安装需要配置受信 HTTPS 地址");
+            }
+            let listener = match tokio::net::TcpListener::bind(addr_v6).await {
+                Ok(l) => l,
+                Err(_) => tokio::net::TcpListener::bind(addr_v4)
+                    .await
+                    .expect("端口绑定失败"),
+            };
+            if let Err(error) = axum::serve(listener, app)
+                .with_graceful_shutdown(wait_for_shutdown(shutdown_receiver))
+                .await
+            {
+                eprintln!("HTTP 服务异常退出: {error}");
+            }
+        }
+    }
+}
+
+// ---------- 工具 ----------
+
+fn err_json(status: StatusCode, msg: impl Into<String>) -> Response {
+    (status, Json(serde_json::json!({ "error": msg.into() }))).into_response()
+}
+
+/// 已知错误文案翻译成可操作的中文提示
+pub(crate) fn friendly_msg(raw: &str) -> String {
+    let l = raw.to_lowercase();
+    if l.contains("invalid 2fa") || raw.contains("双重验证码无效") || raw.contains("双重验证码错误")
+    {
+        "双重验证码无效或已过期，请重新输入".into()
+    } else if l.contains("2fa") || raw.contains("双重验证码") {
+        "需要双重验证码，请完成验证后继续下载".into()
+    } else if l.contains("license is required") {
+        "账号未拥有该 App（免费 App 需先在手机 App Store「获取」一次，付费 App 需先购买）；若确认已拥有，则可能是登录会话过期，请重新登录".into()
+    } else if l.contains("password token is expired") || l.contains("sign in required") {
+        "登录会话已过期，请重新登录".into()
+    } else if raw.contains("未找到登录账号") {
+        "未登录或登录已失效，请登录 Apple ID".into()
+    } else if l.contains("connection reset")
+        || l.contains("request failed")
+        || l.contains("timed out")
+        || l.contains("i/o timeout")
+    {
+        "访问苹果服务器失败（连接被重置/超时，已自动重试）。国内网络建议在应用设置中配置 HTTPS 代理"
+            .into()
+    } else {
+        raw.to_string()
+    }
+}
+
+/// 是否属于登录态问题（前端据此提示重新登录）
+fn is_auth_problem(raw: &str) -> bool {
+    let l = raw.to_lowercase();
+    l.contains("password token is expired")
+        || l.contains("sign in required")
+        || l.contains("license is required")
+}
+
+fn store_err(e: store::StoreError) -> Response {
+    let code_required = jobs::needs_two_factor(&e);
+    let status = match &e {
+        store::StoreError::NoAccount => StatusCode::UNAUTHORIZED,
+        store::StoreError::CodeRequired => StatusCode::BAD_REQUEST,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    let auth_expired = matches!(&e, store::StoreError::NoAccount)
+        || code_required
+        || is_auth_problem(&e.to_string());
+    (
+        status,
+        Json(serde_json::json!({
+            "error": friendly_msg(&e.to_string()),
+            "auth_expired": auth_expired,
+            "code_required": code_required,
+        })),
+    )
+        .into_response()
+}
+
+#[allow(clippy::result_large_err)] // 保留完整 HTTP 响应，让调用点可直接 return
+fn sanitize_file(name: &str) -> std::result::Result<PathBuf, Response> {
+    if name.contains('/') || name.contains("..") || !name.ends_with(".ipa") {
+        return Err(err_json(StatusCode::BAD_REQUEST, "非法文件名"));
+    }
+    let path = match store::config::ipas_dir() {
+        Ok(dir) => dir.join(name),
+        Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    };
+    if !path.exists() {
+        return Err(err_json(StatusCode::NOT_FOUND, "文件不存在"));
+    }
+    Ok(path)
+}
+
+#[allow(clippy::result_large_err)]
+fn ensure_download_space() -> std::result::Result<(), Response> {
+    let dir = store::config::ipas_dir()
+        .map_err(|error| err_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let available = fs2::available_space(&dir)
+        .map_err(|error| err_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let required = std::env::var("IPADOWN_MIN_FREE_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_MIN_FREE_BYTES);
+    if available < required {
+        return Err(err_json(
+            StatusCode::INSUFFICIENT_STORAGE,
+            format!(
+                "存储空间不足：至少需要保留 {:.1} GB 可用空间",
+                required as f64 / 1024_f64.powi(3)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// HTTP/1.1 走 host 头，HTTP/2 的 :authority 由 hyper 写入 URI
+fn req_host<'a>(headers: &'a HeaderMap, uri: &'a axum::http::Uri) -> &'a str {
+    if let Some(h) = headers
+        .get("x-forwarded-host")
+        .and_then(|v| v.to_str().ok())
+    {
+        return h;
+    }
+    if let Some(h) = headers.get("host").and_then(|v| v.to_str().ok()) {
+        return h;
+    }
+    uri.authority().map(|a| a.as_str()).unwrap_or("localhost")
+}
+
+/// 决定对外 base URL：优先 PUBLIC_BASE_URL，最后按反向代理头推导。
+fn base_url(state: &AppState, headers: &HeaderMap, uri: &axum::http::Uri) -> String {
+    if let Some(u) = &state.public_base_url {
+        return u.clone();
+    }
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http");
+    format!("{proto}://{}", req_host(headers, uri))
+}
+
+// ---------- API ----------
+
+async fn api_config(State(s): State<AppState>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "public_base_url": s.public_base_url,
+    }))
+}
+
+#[derive(Deserialize)]
+struct LoginReq {
+    email: String,
+    password: String,
+    code: Option<String>,
+}
+
+async fn api_login(State(state): State<AppState>, Json(req): Json<LoginReq>) -> Response {
+    let login_email = req.email.trim().to_lowercase();
+    if login_email.is_empty() || req.password.is_empty() {
+        return err_json(StatusCode::BAD_REQUEST, "缺少 Apple ID 或密码");
+    }
+    let cfg = match store::config::Config::load_or_create() {
+        Ok(c) => c,
+        Err(e) => return store_err(e),
+    };
+    let ipatool = match store::ipatool::Ipatool::for_account(&cfg, &login_email) {
+        Ok(c) => c,
+        Err(e) => return store_err(e),
+    };
+    match ipatool
+        .login(&login_email, &req.password, req.code.as_deref())
+        .await
+    {
+        Ok(session) => {
+            // 从钥匙串 JWE 解出姓名与国家，登记到多账号配置并设为当前账号
+            let meta = store::ipatool::read_account_meta(&cfg, &login_email)
+                .map(|mut meta| {
+                    meta.email = login_email.clone();
+                    meta
+                })
+                .unwrap_or_else(|| store::config::AccountMeta {
+                    email: login_email.clone(),
+                    country: None,
+                    name: None,
+                });
+            // 登录可能耗时数分钟，成功后重新加载，避免覆盖期间新增的其他账号。
+            let mut latest = match store::config::Config::load_or_create() {
+                Ok(config) => config,
+                Err(error) => return store_err(error),
+            };
+            latest.upsert_account(meta);
+            latest.current_account = Some(login_email.clone());
+            if let Err(error) = latest.save() {
+                return store_err(error);
+            }
+            let cleared_jobs = jobs::clear_two_factor_failures(&state.jobs, &login_email);
+            Json(serde_json::json!({
+                "ok": true,
+                "email": session.email,
+                "cleared_jobs": cleared_jobs,
+            }))
+            .into_response()
+        }
+        Err(store::StoreError::CodeRequired) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": false, "code_required": true })),
+        )
+            .into_response(),
+        Err(e) => store_err(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct LogoutReq {
+    #[serde(default)]
+    email: String,
+}
+
+async fn api_logout(Json(req): Json<LogoutReq>) -> Response {
+    let cfg = match store::config::Config::load_or_create() {
+        Ok(c) => c,
+        Err(e) => return store_err(e),
+    };
+    let email = req.email.trim().to_string();
+    if email.is_empty() {
+        return err_json(StatusCode::BAD_REQUEST, "缺少 email");
+    }
+    let ipatool = match store::ipatool::Ipatool::for_account(&cfg, &email) {
+        Ok(c) => c,
+        Err(e) => return store_err(e),
+    };
+    let _ = ipatool.logout().await; // 吊销失败也继续移除本地记录
+    let mut latest = match store::config::Config::load_or_create() {
+        Ok(config) => config,
+        Err(error) => return store_err(error),
+    };
+    latest.remove_account(&email);
+    if let Err(e) = latest.save() {
+        return store_err(e);
+    }
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+#[derive(Serialize)]
+struct AccountInfo {
+    email: String,
+    country: Option<String>,
+    name: Option<String>,
+    current: bool,
+}
+
+/// 主动刷新/验证登录状态（真实请求苹果商店，而不仅是读本地钥匙串）
+async fn api_auth_refresh() -> Response {
+    let cfg = match store::config::Config::load_or_create() {
+        Ok(c) => c,
+        Err(e) => return store_err(e),
+    };
+    let ipatool = match store::ipatool::Ipatool::new(&cfg) {
+        Ok(c) => c,
+        Err(e) => return store_err(e),
+    };
+    match ipatool.validate_session().await {
+        Ok(session) => {
+            Json(serde_json::json!({ "ok": true, "email": session.email })).into_response()
+        }
+        Err(e) => store_err(e),
+    }
+}
+
+async fn api_accounts() -> Response {
+    let cfg = match store::config::Config::load_or_create() {
+        Ok(c) => c,
+        Err(e) => return store_err(e),
+    };
+    let current = cfg.current_meta().map(|m| m.email.clone());
+    let list: Vec<AccountInfo> = cfg
+        .accounts
+        .iter()
+        .map(|a| AccountInfo {
+            email: a.email.clone(),
+            country: a.country.clone(),
+            name: a.name.clone(),
+            current: Some(&a.email) == current.as_ref(),
+        })
+        .collect();
+    Json(list).into_response()
+}
+
+/// 切换当前账号
+#[derive(Deserialize)]
+struct SelectReq {
+    email: String,
+}
+
+async fn api_auth_select(Json(req): Json<SelectReq>) -> Response {
+    let mut cfg = match store::config::Config::load_or_create() {
+        Ok(c) => c,
+        Err(e) => return store_err(e),
+    };
+    if !cfg.accounts.iter().any(|a| a.email == req.email) {
+        return err_json(StatusCode::NOT_FOUND, "账号不存在");
+    }
+    cfg.current_account = Some(req.email.clone());
+    if let Err(e) = cfg.save() {
+        return store_err(e);
+    }
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    term: String,
+    country: Option<String>,
+    limit: Option<u32>,
+    #[serde(default)]
+    platform: store::search::DevicePlatform,
+}
+
+async fn api_search(Query(q): Query<SearchQuery>) -> Response {
+    let term = q.term.trim();
+    if term.is_empty() || term.chars().count() > 200 {
+        return err_json(StatusCode::BAD_REQUEST, "搜索词长度必须在 1–200 个字符之间");
+    }
+    let country = q.country.unwrap_or_else(|| "CN".into()).to_uppercase();
+    if country.len() != 2 || !country.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        return err_json(StatusCode::BAD_REQUEST, "非法国家/地区代码");
+    }
+    match store::search::search(
+        term,
+        &country,
+        q.limit.unwrap_or(15).clamp(1, 50),
+        q.platform,
+    )
+    .await
+    {
+        Ok(results) => Json(results).into_response(),
+        Err(e) => store_err(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct VersionsQuery {
+    bundle_id: String,
+    app_id: i64,
+    country: String,
+    #[serde(default)]
+    platform: store::search::DevicePlatform,
+}
+
+impl VersionsQuery {
+    #[allow(clippy::result_large_err)]
+    fn validate(&self) -> std::result::Result<(), Response> {
+        jobs::download_filename(&self.bundle_id, None, self.platform)
+            .map_err(|message| err_json(StatusCode::BAD_REQUEST, message))?;
+        if self.app_id <= 0 {
+            return Err(err_json(StatusCode::BAD_REQUEST, "非法 App Store ID"));
+        }
+        if self.country.len() != 2 || !self.country.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+            return Err(err_json(StatusCode::BAD_REQUEST, "非法国家/地区代码"));
+        }
+        Ok(())
+    }
+
+    fn cache_key(&self) -> String {
+        format!(
+            "{}\0{}\0{}\0{}",
+            self.country.to_ascii_uppercase(),
+            self.app_id,
+            self.bundle_id,
+            self.platform.ipatool_value(),
+        )
+    }
+}
+
+/// 爱果提供历史版本 ID，App Store 提供官方更新日志；ipatool 仅用于最终下载。
+#[allow(clippy::result_large_err)]
+async fn get_version_catalog(
+    state: &AppState,
+    query: &VersionsQuery,
+) -> std::result::Result<Arc<store::history::VersionCatalog>, Response> {
+    query.validate()?;
+    let key = query.cache_key();
+    if let Some(catalog) = state.versions.lock().unwrap().get(&key) {
+        return Ok(catalog);
+    }
+
+    let catalog = store::history::versions(query.app_id, &query.country)
+        .await
+        .map_err(store_err)?;
+    if catalog.bundle_id != query.bundle_id {
+        return Err(store_err(store::StoreError::UnexpectedResponse(format!(
+            "爱果返回的 Bundle ID 不匹配：期望 {}，实际 {}",
+            query.bundle_id, catalog.bundle_id
+        ))));
+    }
+    let catalog = Arc::new(catalog);
+    if catalog
+        .versions
+        .iter()
+        .any(|version| version.release_notes.is_some())
+    {
+        state.versions.lock().unwrap().insert(key, catalog.clone());
+    }
+    Ok(catalog)
+}
+
+async fn api_versions(State(s): State<AppState>, Query(q): Query<VersionsQuery>) -> Response {
+    match get_version_catalog(&s, &q).await {
+        Ok(catalog) => Json(serde_json::json!({
+            "app": {
+                "name": catalog.name,
+                "bundle_id": catalog.bundle_id,
+                "version": catalog.current_version,
+            },
+            "versions": catalog.versions.iter().map(|item| serde_json::json!({
+                "version_id": item.version_id,
+                "display_version": item.version,
+                "release_date": item.release_date,
+                "size": item.size,
+                "release_notes": item.release_notes,
+            })).collect::<Vec<_>>(),
+            "source": "app.agzy.cn",
+            "release_notes_source": "apps.apple.com",
+            "updated_at": catalog.updated_at,
+        }))
+        .into_response(),
+        Err(e) => e,
+    }
+}
+
+async fn api_downloads(State(s): State<AppState>) -> impl IntoResponse {
+    Json(jobs::list(&s.jobs))
+}
+
+#[derive(Deserialize)]
+struct DownloadReq {
+    bundle_id: String,
+    version_id: Option<String>,
+    #[serde(default)]
+    platform: store::search::DevicePlatform,
+}
+
+async fn api_download_start(State(s): State<AppState>, Json(req): Json<DownloadReq>) -> Response {
+    if let Err(message) =
+        jobs::download_filename(&req.bundle_id, req.version_id.as_deref(), req.platform)
+    {
+        return err_json(StatusCode::BAD_REQUEST, message);
+    }
+    if let Err(response) = ensure_download_space() {
+        return response;
+    }
+    let cfg = match store::config::Config::load_or_create() {
+        Ok(c) => c,
+        Err(e) => return store_err(e),
+    };
+    let ipatool = match store::ipatool::Ipatool::new(&cfg) {
+        Ok(c) => c,
+        Err(e) => return store_err(e),
+    };
+    // 下载前真实访问一次商店，立即识别失效会话和 2FA 挑战，避免任务入队后才静默失败。
+    match ipatool.validate_session().await {
+        Ok(session) => {
+            match jobs::spawn_download(
+                s.jobs.clone(),
+                req.bundle_id,
+                req.version_id,
+                req.platform,
+                session.email,
+                ipatool,
+            ) {
+                Ok(reused) => Json(serde_json::json!({
+                    "reused": reused,
+                }))
+                .into_response(),
+                Err(message) => err_json(
+                    if message.starts_with("下载队列已满") {
+                        StatusCode::TOO_MANY_REQUESTS
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    },
+                    message,
+                ),
+            }
+        }
+        Err(e) => store_err(e),
+    }
+}
+
+#[derive(Serialize)]
+struct FileInfo {
+    name: String,
+    size: u64,
+    bundle_id: Option<String>,
+    version: Option<String>,
+    title: Option<String>,
+    platform: store::search::DevicePlatform,
+    artwork_url: Option<String>,
+}
+
+fn downloaded_file_platform(name: &str) -> store::search::DevicePlatform {
+    let stem = name.strip_suffix(".ipa").unwrap_or(name);
+    if stem.ends_with("_appletv") {
+        store::search::DevicePlatform::Appletv
+    } else if stem.ends_with("_ipad") {
+        store::search::DevicePlatform::Ipad
+    } else {
+        store::search::DevicePlatform::Iphone
+    }
+}
+
+async fn artwork_for_file(
+    state: &AppState,
+    bundle_id: &str,
+    country: &str,
+    platform: store::search::DevicePlatform,
+) -> Option<String> {
+    let key = format!("{country}\0{}\0{bundle_id}", platform.ipatool_value());
+    if let Some(cached) = state.artwork.lock().unwrap().get(&key) {
+        return cached;
+    }
+
+    let mut countries = vec![country];
+    if country != "CN" {
+        countries.push("CN");
+    }
+    if country != "US" {
+        countries.push("US");
+    }
+    let mut artwork = None;
+    for candidate in countries {
+        if let Ok(app) = store::search::lookup(bundle_id, candidate, platform).await {
+            artwork = app
+                .artwork_url
+                .map(|url| url.replace("512x512bb", "100x100bb"));
+            if artwork.is_some() {
+                break;
+            }
+        }
+    }
+    state.artwork.lock().unwrap().insert(key, artwork.clone());
+    artwork
+}
+
+async fn api_files(State(state): State<AppState>) -> Response {
+    let dir = match store::config::ipas_dir() {
+        Ok(d) => d,
+        Err(e) => return store_err(e),
+    };
+    let mut files = Vec::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".ipa") {
+                continue;
+            }
+            let size = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
+            let path = entry.path();
+            let meta = tokio::task::spawn_blocking(move || store::ipa::read_metadata(&path))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default();
+            files.push(FileInfo {
+                platform: downloaded_file_platform(&name),
+                name,
+                size,
+                bundle_id: meta.bundle_id,
+                version: meta.bundle_version,
+                title: meta.display_name,
+                artwork_url: None,
+            });
+        }
+    }
+    files.sort_by(|a, b| b.name.cmp(&a.name));
+    let country = store::config::Config::load_or_create()
+        .ok()
+        .and_then(|config| config.current_meta().and_then(|meta| meta.country.clone()))
+        .map(|country| country.to_uppercase())
+        .unwrap_or_else(|| "CN".into());
+    let mut groups: HashMap<String, (String, store::search::DevicePlatform, Vec<usize>)> =
+        HashMap::new();
+    for (index, file) in files.iter().enumerate() {
+        if let Some(bundle_id) = file.bundle_id.as_deref() {
+            let key = format!("{country}\0{}\0{bundle_id}", file.platform.ipatool_value());
+            groups
+                .entry(key)
+                .or_insert_with(|| (bundle_id.to_string(), file.platform, Vec::new()))
+                .2
+                .push(index);
+        }
+    }
+    let limiter = Arc::new(tokio::sync::Semaphore::new(6));
+    let mut lookups = tokio::task::JoinSet::new();
+    for (_, (bundle_id, platform, indices)) in groups {
+        let state = state.clone();
+        let country = country.clone();
+        let limiter = limiter.clone();
+        lookups.spawn(async move {
+            let _permit = limiter.acquire_owned().await.ok();
+            let artwork = artwork_for_file(&state, &bundle_id, &country, platform).await;
+            (indices, artwork)
+        });
+    }
+    while let Some(Ok((indices, artwork))) = lookups.join_next().await {
+        for index in indices {
+            files[index].artwork_url = artwork.clone();
+        }
+    }
+    Json(files).into_response()
+}
+
+async fn api_file_delete(State(s): State<AppState>, Path(file): Path<String>) -> Response {
+    let path = match sanitize_file(&file) {
+        Ok(path) => path,
+        Err(response) => return response,
+    };
+    if jobs::is_file_active(&s.jobs, &file) {
+        return err_json(StatusCode::CONFLICT, "该文件正在下载，无法删除");
+    }
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(error) => err_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+struct OtaEntry {
+    base: String,
+    bundle_id: String,
+    bundle_version: String,
+    title: String,
+}
+
+#[allow(clippy::result_large_err)]
+fn ota_entry_for(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+    file: &str,
+) -> std::result::Result<OtaEntry, Response> {
+    let path = sanitize_file(file)?;
+    let meta = store::ipa::read_metadata(&path).unwrap_or_default();
+    Ok(OtaEntry {
+        base: base_url(state, headers, uri),
+        bundle_id: meta.bundle_id.unwrap_or_else(|| "unknown".into()),
+        bundle_version: meta.bundle_version.unwrap_or_else(|| "1.0".into()),
+        title: meta.display_name.unwrap_or_else(|| file.to_string()),
+    })
+}
+
+fn install_link(base: &str, file: &str, token: &str) -> serde_json::Value {
+    let file_segment = ipadown_ota::url_encode(file);
+    let manifest_url = format!("{base}/ota/{file_segment}/manifest.plist?token={token}");
+    let itms_url = format!(
+        "itms-services://?action=download-manifest&url={}",
+        ipadown_ota::url_encode(&manifest_url)
+    );
+    serde_json::json!({
+        "itms_url": itms_url,
+        "https": base.starts_with("https://"),
+    })
+}
+
+fn is_safari_user_agent(headers: &HeaderMap) -> bool {
+    let Some(user_agent) = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let has_safari_engine = user_agent.contains("AppleWebKit/")
+        && user_agent.contains("Safari/")
+        && user_agent.contains("Version/");
+    let is_other_browser = [
+        "CriOS/",
+        "Chrome/",
+        "FxiOS/",
+        "Firefox/",
+        "EdgiOS/",
+        "Edg/",
+        "OPiOS/",
+        "OPR/",
+        "DuckDuckGo/",
+        "GSA/",
+        "YaBrowser/",
+        "SamsungBrowser/",
+    ]
+    .iter()
+    .any(|marker| user_agent.contains(marker));
+    has_safari_engine && !is_other_browser
+}
+
+async fn api_install(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+    Path(file): Path<String>,
+) -> Response {
+    if !is_safari_user_agent(&headers) {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "仅支持使用 Safari 浏览器打开并安装",
+        );
+    }
+    if let Err(response) = sanitize_file(&file) {
+        return response;
+    }
+    let token = s.install_tokens.issue(&file);
+    let install = install_link(&base_url(&s, &headers, &uri), &file, &token);
+    Json(serde_json::json!({
+        "install": install,
+    }))
+    .into_response()
+}
+
+async fn ota_manifest(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+    Path(file): Path<String>,
+    Query(access): Query<OtaAccessQuery>,
+) -> Response {
+    if !ota_access_allowed(&s, &file, access.token.as_deref()) {
+        return err_json(StatusCode::FORBIDDEN, "安装链接无效或已过期，请重新生成");
+    }
+    let entry = match ota_entry_for(&s, &headers, &uri, &file) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let token = access.token.unwrap_or_default();
+    let file_segment = ipadown_ota::url_encode(&file);
+    let ipa_url = format!("{}/ota/{file_segment}/app.ipa?token={token}", entry.base);
+    let xml = ipadown_ota::manifest_plist(
+        &ipa_url,
+        &entry.bundle_id,
+        &entry.bundle_version,
+        &entry.title,
+    );
+    ([("Content-Type", "application/xml")], xml).into_response()
+}
+
+#[derive(Deserialize)]
+struct OtaAccessQuery {
+    token: Option<String>,
+}
+
+fn ota_access_allowed(state: &AppState, file: &str, token: Option<&str>) -> bool {
+    token.is_some_and(|token| state.install_tokens.allows(token, file))
+}
+
+async fn ota_ipa(
+    State(s): State<AppState>,
+    Path(file): Path<String>,
+    Query(access): Query<OtaAccessQuery>,
+) -> Response {
+    if !ota_access_allowed(&s, &file, access.token.as_deref()) {
+        return err_json(StatusCode::FORBIDDEN, "安装链接无效或已过期，请重新生成");
+    }
+    let path = match sanitize_file(&file) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) => return err_json(StatusCode::NOT_FOUND, e.to_string()),
+    };
+    let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    Response::builder()
+        .header("Content-Type", "application/octet-stream")
+        .header("Content-Length", len.to_string())
+        .body(Body::from_stream(tokio_util::io::ReaderStream::new(file)))
+        .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_tokens_are_unpredictable_and_bound_to_one_file() {
+        let tokens = InstallTokens::default();
+        let first = tokens.issue("com.example_1.ipa");
+        let second = tokens.issue("com.example_1.ipa");
+
+        assert_ne!(first, second);
+        assert!(tokens.allows(&first, "com.example_1.ipa"));
+        assert!(!tokens.allows(&first, "com.example_2.ipa"));
+        assert!(!tokens.allows("missing", "com.example_1.ipa"));
+    }
+
+    #[test]
+    fn install_token_store_is_bounded() {
+        let tokens = InstallTokens::default();
+        for index in 0..(MAX_INSTALL_TOKENS + 10) {
+            tokens.issue(&format!("com.example_{index}.ipa"));
+        }
+        assert_eq!(tokens.0.lock().unwrap().len(), MAX_INSTALL_TOKENS);
+    }
+
+    #[test]
+    fn version_catalog_cache_is_bounded() {
+        let mut cache = VersionsCache::default();
+        for index in 0..(MAX_HISTORY_CACHE_ENTRIES + 10) {
+            cache.insert(
+                index.to_string(),
+                Arc::new(store::history::VersionCatalog {
+                    name: "App".into(),
+                    bundle_id: "com.example.app".into(),
+                    current_version: "1.0".into(),
+                    updated_at: String::new(),
+                    versions: Vec::new(),
+                }),
+            );
+        }
+        assert_eq!(cache.catalogs.len(), MAX_HISTORY_CACHE_ENTRIES);
+    }
+
+    #[test]
+    fn artwork_cache_is_bounded_and_caches_missing_icons() {
+        let mut cache = ArtworkCache::default();
+        for index in 0..(MAX_ARTWORK_CACHE_ENTRIES + 10) {
+            cache.insert(index.to_string(), None);
+        }
+        assert_eq!(cache.entries.len(), MAX_ARTWORK_CACHE_ENTRIES);
+        assert_eq!(cache.get("265"), Some(None));
+    }
+
+    #[test]
+    fn downloaded_filenames_recover_the_selected_platform() {
+        assert_eq!(
+            downloaded_file_platform("com.example_1.ipa"),
+            store::search::DevicePlatform::Iphone
+        );
+        assert_eq!(
+            downloaded_file_platform("com.example_1_ipad.ipa"),
+            store::search::DevicePlatform::Ipad
+        );
+        assert_eq!(
+            downloaded_file_platform("com.example_1_appletv.ipa"),
+            store::search::DevicePlatform::Appletv
+        );
+    }
+
+    #[test]
+    fn security_headers_protect_sensitive_responses() {
+        let mut response = Response::new(Body::empty());
+        apply_security_headers(&mut response);
+
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
+        assert_eq!(response.headers()[header::X_FRAME_OPTIONS], "DENY");
+        assert_eq!(
+            response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+        assert!(response.headers().contains_key("permissions-policy"));
+    }
+
+    #[test]
+    fn credential_comparison_checks_content_and_length() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"Secret"));
+        assert!(!constant_time_eq(b"secret", b"secret-longer"));
+    }
+
+    fn headers_with_user_agent(user_agent: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::USER_AGENT, user_agent.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn safari_detection_accepts_safari_and_rejects_wrapped_browsers() {
+        let safari = headers_with_user_agent(
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+        );
+        let chrome = headers_with_user_agent(
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/128.0 Mobile/15E148 Safari/604.1",
+        );
+        let webview = headers_with_user_agent(
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148",
+        );
+
+        assert!(is_safari_user_agent(&safari));
+        assert!(!is_safari_user_agent(&chrome));
+        assert!(!is_safari_user_agent(&webview));
+    }
+
+    #[test]
+    fn frontend_browser_gate_shows_and_copies_the_current_app_address() {
+        assert!(INDEX_HTML.contains("id=\"safari-address\""));
+        assert!(INDEX_HTML.contains("id=\"copy-safari-address\""));
+        assert!(INDEX_HTML.contains("resolvedSafariAddress=location.origin"));
+        assert!(INDEX_HTML.contains("config.public_base_url"));
+        assert!(INDEX_HTML.contains("const address=await safariAddressPromise"));
+        assert!(INDEX_HTML.contains("navigator.clipboard?.writeText"));
+        assert!(INDEX_HTML.contains("document.execCommand('copy')"));
+        assert!(!INDEX_HTML.contains("subdomain.微服名.heiyu.space"));
+    }
+
+    #[test]
+    fn frontend_downloaded_files_use_compact_rows_with_artwork() {
+        assert!(INDEX_HTML.contains("class=\"file-row\""));
+        assert!(INDEX_HTML.contains("file.artwork_url"));
+        assert!(INDEX_HTML.contains("platformLabel(file.platform)"));
+        assert!(!INDEX_HTML.contains("responsive-table"));
+    }
+
+    #[tokio::test]
+    async fn two_factor_error_response_is_machine_readable() {
+        let response = store_err(store::StoreError::CodeRequired);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code_required"], true);
+        assert_eq!(json["auth_expired"], true);
+        assert!(!json["error"].as_str().unwrap().contains("--code"));
+    }
+
+    #[test]
+    fn frontend_prompts_for_two_factor_and_uses_three_tab_navigation() {
+        assert!(INDEX_HTML.contains("error.codeRequired"));
+        assert!(INDEX_HTML.contains("job.needs_2fa"));
+        assert!(INDEX_HTML.contains("openLoginModal(true,challenge.account"));
+
+        let header = INDEX_HTML.split("</header>").next().unwrap();
+        assert!(!header.contains("account-trigger"));
+        assert!(INDEX_HTML.contains("data-tab=\"account\""));
+        assert!(INDEX_HTML.contains("data-tab=\"search\""));
+        assert!(INDEX_HTML.contains("data-tab=\"download\""));
+        assert_eq!(INDEX_HTML.matches("class=\"tab-button").count(), 3);
+    }
+
+    #[test]
+    fn frontend_platform_switch_reaches_search_versions_and_downloads() {
+        for platform in ["iphone", "ipad", "appletv"] {
+            assert!(INDEX_HTML.contains(&format!("data-platform=\"{platform}\"")));
+        }
+        let header = INDEX_HTML
+            .split("<header class=\"nav\">")
+            .nth(1)
+            .unwrap()
+            .split("</header>")
+            .next()
+            .unwrap();
+        assert!(header.contains("id=\"device-trigger\""));
+        assert!(header.contains("id=\"device-menu\""));
+        assert_eq!(header.matches("data-platform=").count(), 3);
+        let search_panel = INDEX_HTML
+            .split("id=\"panel-search\"")
+            .nth(1)
+            .unwrap()
+            .split("id=\"panel-download\"")
+            .next()
+            .unwrap();
+        assert!(!search_panel.contains("data-platform="));
+        assert!(INDEX_HTML.contains("&platform=${encodeURIComponent(platform)}"));
+        assert!(INDEX_HTML.contains(
+            "body:JSON.stringify({bundle_id:bundleId,version_id:versionId || undefined,platform})"
+        ));
+        assert!(INDEX_HTML.contains("pendingDownload={bundleId,versionId,platform}"));
+    }
+
+    #[test]
+    fn frontend_versions_open_details_and_load_on_scroll_without_filters_or_pages() {
+        assert!(INDEX_HTML.contains("function showVersionDetail"));
+        assert!(INDEX_HTML.contains("IntersectionObserver"));
+        assert!(INDEX_HTML.contains("VERSION_BATCH_SIZE=20"));
+        assert!(INDEX_HTML.contains("(result.versions || []).map"));
+        assert!(!INDEX_HTML.contains("result.ids"));
+        assert!(!INDEX_HTML.contains("class=\"filters\""));
+        assert!(!INDEX_HTML.contains("function pageWindow"));
+
+        let list_renderer = INDEX_HTML
+            .split("function versionItemHtml")
+            .nth(1)
+            .unwrap()
+            .split("function stopVersionObserver")
+            .next()
+            .unwrap();
+        assert!(!list_renderer.contains("startDownload"));
+
+        let detail_renderer = INDEX_HTML
+            .split("function showVersionDetail")
+            .nth(1)
+            .unwrap()
+            .split("function backToVersionList")
+            .next()
+            .unwrap();
+        assert!(detail_renderer.contains("startDownload"));
+        assert!(detail_renderer.contains("entry.release_notes"));
+        assert!(detail_renderer.contains("更新日志"));
+        assert!(INDEX_HTML.contains("function versionDetailIsOpen()"));
+        assert!(INDEX_HTML
+            .contains("if (!force && versionDetailIsOpen()) { backToVersionList(); return; }"));
+        assert!(INDEX_HTML.contains("closeModal(true); showTab('download')"));
+    }
+
+    #[test]
+    fn frontend_escapes_inline_arguments_and_ignores_stale_requests() {
+        assert!(INDEX_HTML.contains("replace(/'/g,'%27')"));
+        assert!(INDEX_HTML.contains("let searchRequestId=0"));
+        assert!(INDEX_HTML.contains("let versionRequestId=0"));
+        assert!(INDEX_HTML.contains("if (requestId!==searchRequestId)"));
+        assert!(INDEX_HTML.contains("if (requestId!==versionRequestId) return"));
+    }
+
+    #[test]
+    fn frontend_login_modal_is_compact_aligned_and_free_of_decorative_copy() {
+        assert!(INDEX_HTML.contains(".modal.compact { width:min(430px,94vw); }"));
+        assert!(INDEX_HTML.contains(".modal h3 { min-height:30px;"));
+        assert!(INDEX_HTML.contains("position:absolute; top:17px; right:17px;"));
+        assert!(INDEX_HTML.contains(".modal .close { top:14px; right:12px; }"));
+        assert!(!INDEX_HTML.contains("margin:0 0 -30px auto"));
+        assert!(INDEX_HTML.contains("class=\"login-form\""));
+        assert!(INDEX_HTML.contains("</div>`,false,true);"));
+        assert!(!INDEX_HTML.contains("float:right"));
+        assert!(!INDEX_HTML.contains("历史版本 · Safari 直接安装"));
+        assert!(!INDEX_HTML.contains("新到旧 ·"));
+    }
+
+    #[test]
+    fn package_includes_store_required_english_locale() {
+        let package = include_str!("../../../package.yml");
+        let locales = package
+            .split_once("\nlocales:\n")
+            .and_then(|(_, rest)| rest.split_once("\npermissions:"))
+            .map(|(locales, _)| locales)
+            .expect("package.yml must contain locales before permissions");
+
+        assert!(locales.contains("  en:\n    name: "));
+        assert!(locales.contains("  en:\n    name: ipaDown\n    description: "));
+    }
+
+    #[test]
+    fn frontend_refreshes_files_on_changes_instead_of_continuous_polling() {
+        assert!(INDEX_HTML.contains("function keepJobsUpdated"));
+        assert!(INDEX_HTML.contains("completedJobIds"));
+        assert!(!INDEX_HTML.contains("setInterval(refreshFiles"));
+    }
+
+    #[test]
+    fn frontend_avoids_ios_input_auto_zoom_without_disabling_accessibility_zoom() {
+        let viewport = INDEX_HTML
+            .split("<meta name=\"viewport\" content=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        assert!(!viewport.contains("user-scalable=no"));
+        assert!(!viewport.contains("maximum-scale=1"));
+        assert!(INDEX_HTML.contains("input { font-size:16px; }"));
+        assert!(INDEX_HTML.contains("touch-action:manipulation"));
+    }
+
+    #[test]
+    fn frontend_modal_locks_ios_page_scroll_and_guards_scroll_edges() {
+        assert!(INDEX_HTML.contains("function lockPageScroll()"));
+        assert!(INDEX_HTML.contains("function unlockPageScroll()"));
+        assert!(INDEX_HTML.contains("lockPageScroll();"));
+        assert!(INDEX_HTML.contains("unlockPageScroll();"));
+        assert!(INDEX_HTML.contains("function guardModalTouchMove"));
+        assert!(INDEX_HTML.contains("{passive:false}"));
+    }
+
+    #[test]
+    fn frontend_download_gives_immediate_progress_feedback() {
+        assert!(INDEX_HTML.contains("id=\"download-feedback\""));
+        assert!(INDEX_HTML.contains("aria-busy"));
+        assert!(INDEX_HTML.contains("class=\"button-spinner\""));
+        assert!(INDEX_HTML.contains("正在验证 Apple ID 并创建下载任务"));
+
+        let start_download = INDEX_HTML
+            .split("async function startDownload")
+            .nth(1)
+            .unwrap()
+            .split("async function pollJobs")
+            .next()
+            .unwrap();
+        assert!(
+            start_download.find("button.disabled=true").unwrap()
+                < start_download.find("await api('/api/downloads'").unwrap()
+        );
+    }
+
+    #[test]
+    fn frontend_desktop_debug_unlock_requires_five_silent_icon_clicks() {
+        assert!(INDEX_HTML.contains("id=\"browser-gate-icon\""));
+        assert!(INDEX_HTML.contains("function isDesktopBrowser()"));
+        assert!(INDEX_HTML.contains("function handleDesktopDebugClick()"));
+        assert!(INDEX_HTML.contains("desktopDebugClicks < 5"));
+        assert!(INDEX_HTML.contains("sessionStorage"));
+        assert!(INDEX_HTML.contains("id=\"desktop-debug-banner\""));
+
+        let before_unlock = INDEX_HTML
+            .split("function handleDesktopDebugClick()")
+            .nth(1)
+            .unwrap()
+            .split("enableDesktopDebug();")
+            .next()
+            .unwrap();
+        assert!(!before_unlock.contains("toast("));
+        assert!(!before_unlock.contains("textContent"));
+    }
+}
