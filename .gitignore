@@ -3,3 +3,4 @@
 .lzc-cli-cache/
 /data
 .env
+.ipatool-cache/

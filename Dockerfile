@@ -23,7 +23,8 @@ RUN arch="${TARGETARCH:-amd64}" \
          arm64) expected="7c7ce6c54379683d77b99d39f1d1a766fd8de3ae09ae8c4c64f5d04232e6ae80" ;; \
          *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
        esac \
-    && curl -sfL "https://github.com/majd/ipatool/releases/download/v${IPATOOL_VERSION}/ipatool-${IPATOOL_VERSION}-linux-${arch}.tar.gz" -o /tmp/ipatool.tgz \
+    && curl -sfL --retry 5 --retry-all-errors --retry-delay 5 \
+         "https://github.com/majd/ipatool/releases/download/v${IPATOOL_VERSION}/ipatool-${IPATOOL_VERSION}-linux-${arch}.tar.gz" -o /tmp/ipatool.tgz \
     && echo "$expected  /tmp/ipatool.tgz" | sha256sum -c - \
     && tar xzf /tmp/ipatool.tgz -C /tmp \
     && mv "/tmp/bin/ipatool-${IPATOOL_VERSION}-linux-${arch}" /usr/local/bin/ipatool \
