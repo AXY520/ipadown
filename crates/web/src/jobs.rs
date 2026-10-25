@@ -18,6 +18,9 @@ pub(super) struct Job {
     /// queued | downloading | done | error
     status: String,
     downloaded: u64,
+    /// 预估安装包总字节数（来自历史版本目录或商店 lookup），供前端显示百分比
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total: Option<u64>,
     error: Option<String>,
     /// 前端据此弹出双重认证对话框，而不是解析错误文案。
     needs_2fa: bool,
@@ -32,6 +35,7 @@ impl Job {
         version_id: Option<&str>,
         platform: store::search::DevicePlatform,
         account: &str,
+        total: Option<u64>,
     ) -> Self {
         Job {
             id: id.to_string(),
@@ -42,6 +46,7 @@ impl Job {
             account: account.to_string(),
             status: "queued".into(),
             downloaded: 0,
+            total,
             error: None,
             needs_2fa: false,
             created_at: unix_now(),
@@ -182,6 +187,7 @@ fn reserve_job(
     version_id: Option<&str>,
     platform: store::search::DevicePlatform,
     account_email: &str,
+    total: Option<u64>,
 ) -> Result<Option<String>, &'static str> {
     let mut jobs = jobs_map(reg);
     if jobs.values().any(|job| {
@@ -202,18 +208,20 @@ fn reserve_job(
     let id = crate::random_id();
     jobs.insert(
         id.clone(),
-        Job::new(&id, bundle_id, version_id, platform, account_email),
+        Job::new(&id, bundle_id, version_id, platform, account_email, total),
     );
     Ok(Some(id))
 }
 
 /// 启动后台下载任务（走 ipatool 子进程，含 SAP 签名），返回是否复用已有任务。
+/// `total` 为预估安装包大小（字节），供前端进度条显示百分比。
 pub(super) fn spawn_download(
     reg: Registry,
     bundle_id: String,
     version_id: Option<String>,
     platform: store::search::DevicePlatform,
     account_email: String,
+    total: Option<u64>,
     ipatool: store::ipatool::Ipatool,
 ) -> Result<bool, &'static str> {
     let filename = download_filename(&bundle_id, version_id.as_deref(), platform)?;
@@ -223,6 +231,7 @@ pub(super) fn spawn_download(
         version_id.as_deref(),
         platform,
         &account_email,
+        total,
     )?
     else {
         return Ok(true);
@@ -282,10 +291,15 @@ async fn run_download(
     // 入队前同步校验会话（auth info + 真实商店请求），失败/2FA 直接让任务失败，
     // 前端轮询 needs_2fa 后弹验证码对话框。
     ipatool.validate_session().await?;
-    // 用公开搜索 API 补充应用名（多区依次尝试）
+    // 用公开搜索 API 补充应用名（多区依次尝试）；未提供大小时顺带拿到当前版本包大小
     for country in ["CN", "US", "JP"] {
         if let Ok(app) = store::search::lookup(bundle_id, country, platform).await {
-            update(reg, id, |j| j.app_name = Some(app.name));
+            update(reg, id, |j| {
+                j.app_name = Some(app.name);
+                if j.total.is_none() {
+                    j.total = app.file_size_bytes;
+                }
+            });
             break;
         }
     }
@@ -378,6 +392,7 @@ mod tests {
             Some("123"),
             DevicePlatform::Iphone,
             "a@example.com",
+            None,
         );
 
         job.record_failure(&StoreError::CodeRequired);
@@ -395,6 +410,7 @@ mod tests {
             Some("123"),
             DevicePlatform::Iphone,
             "a@example.com",
+            None,
         );
         let value = serde_json::to_value(job).unwrap();
 
@@ -411,6 +427,7 @@ mod tests {
             Some("123"),
             DevicePlatform::Iphone,
             "a@example.com",
+            None,
         );
         job.record_failure(&StoreError::CodeRequired);
         let mut other_error = Job::new(
@@ -419,6 +436,7 @@ mod tests {
             None,
             DevicePlatform::Iphone,
             "a@example.com",
+            None,
         );
         other_error.record_failure(&StoreError::AuthFailed("network".into()));
         let mut other_account = Job::new(
@@ -427,6 +445,7 @@ mod tests {
             None,
             DevicePlatform::Iphone,
             "b@example.com",
+            None,
         );
         other_account.record_failure(&StoreError::CodeRequired);
         let mut jobs = registry.jobs.lock().unwrap();
@@ -449,7 +468,8 @@ mod tests {
             "com.example.app",
             Some("1"),
             DevicePlatform::Iphone,
-            "a@example.com"
+            "a@example.com",
+            None
         )
         .unwrap()
         .is_some());
@@ -458,7 +478,8 @@ mod tests {
             "com.example.app",
             Some("1"),
             DevicePlatform::Iphone,
-            "a@example.com"
+            "a@example.com",
+            None
         )
         .unwrap()
         .is_none());
@@ -469,7 +490,8 @@ mod tests {
                 &format!("com.example.app{index}"),
                 None,
                 DevicePlatform::Iphone,
-                "a@example.com"
+                "a@example.com",
+                None
             )
             .unwrap()
             .is_some());
@@ -479,7 +501,8 @@ mod tests {
             "com.example.overflow",
             None,
             DevicePlatform::Iphone,
-            "a@example.com"
+            "a@example.com",
+            None
         )
         .is_err());
     }
@@ -492,7 +515,8 @@ mod tests {
             "com.example.app",
             Some("1"),
             DevicePlatform::Iphone,
-            "a@example.com"
+            "a@example.com",
+            None
         )
         .unwrap()
         .is_some());
@@ -501,7 +525,8 @@ mod tests {
             "com.example.app",
             Some("1"),
             DevicePlatform::Ipad,
-            "a@example.com"
+            "a@example.com",
+            None
         )
         .unwrap()
         .is_some());

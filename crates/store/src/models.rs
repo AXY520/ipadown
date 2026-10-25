@@ -30,4 +30,10 @@ pub struct Software {
         default
     )]
     pub formatted_price: Option<String>,
+    #[serde(
+        rename(deserialize = "fileSizeBytes", serialize = "file_size_bytes"),
+        default
+    )]
+    /// 当前版本安装包大小（字节），用作 latest 下载的进度条总量
+    pub file_size_bytes: Option<u64>,
 }

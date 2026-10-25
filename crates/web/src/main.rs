@@ -20,6 +20,8 @@ use tokio::io::AsyncSeekExt;
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
 const APP_JS: &str = include_str!("../static/app.js");
+/// 网站图标（与 lpk 应用图标同源）
+const ICON_PNG: &[u8] = include_bytes!("../../../icon.png");
 
 /// 历史版本目录与 App Store 更新日志缓存有效期。
 const HISTORY_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
@@ -249,7 +251,7 @@ fn apply_security_headers(response: &mut Response, path: &str) {
     // 缓存策略：OTA 走 ETag/Range 条件请求；静态页面可复验；API 响应不落盘。
     let cache_policy = if path.starts_with("/ota/") {
         "private, max-age=0, must-revalidate"
-    } else if path == "/" || path == "/app.js" {
+    } else if path == "/" || path == "/app.js" || path == "/icon.png" {
         "no-cache"
     } else {
         "no-store"
@@ -384,6 +386,10 @@ async fn main() {
                     APP_JS,
                 )
             }),
+        )
+        .route(
+            "/icon.png",
+            axum::routing::get(|| async { ([(header::CONTENT_TYPE, "image/png")], ICON_PNG) }),
         )
         .route("/api/config", axum::routing::get(api_config))
         .route("/api/auth/login", axum::routing::post(api_login))
@@ -921,7 +927,12 @@ struct DownloadReq {
     version_id: Option<String>,
     #[serde(default)]
     platform: store::search::DevicePlatform,
+    /// 预估安装包大小（字节，来自历史版本目录的体积字符串），仅用于进度条展示
+    #[serde(default)]
+    size: Option<u64>,
 }
+
+const MAX_EXPECTED_IPA_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 async fn api_download_start(State(s): State<AppState>, Json(req): Json<DownloadReq>) -> Response {
     if let Err(message) =
@@ -944,14 +955,18 @@ async fn api_download_start(State(s): State<AppState>, Json(req): Json<DownloadR
         .current_meta()
         .map(|meta| meta.email.clone())
         .unwrap_or_default();
+    let total = req
+        .size
+        .filter(|size| *size > 0 && *size <= MAX_EXPECTED_IPA_BYTES);
     // 会话有效性在任务内校验：ipatool 子进程可能耗时数分钟，
     // 不阻塞本请求；失效或 2FA 时任务失败，前端轮询到后弹出对应处理。
     store::log_info!(
         "download",
-        "requested bundle={} version={} platform={} account={account}",
+        "requested bundle={} version={} platform={} account={account} total={}",
         req.bundle_id,
         req.version_id.as_deref().unwrap_or("latest"),
-        req.platform.ipatool_value()
+        req.platform.ipatool_value(),
+        total.unwrap_or(0)
     );
     match jobs::spawn_download(
         s.jobs.clone(),
@@ -959,6 +974,7 @@ async fn api_download_start(State(s): State<AppState>, Json(req): Json<DownloadR
         req.version_id,
         req.platform,
         account,
+        total,
         ipatool,
     ) {
         Ok(reused) => Json(serde_json::json!({
@@ -1517,6 +1533,7 @@ mod tests {
             ("/api/search", "no-store"),
             ("/", "no-cache"),
             ("/app.js", "no-cache"),
+            ("/icon.png", "no-cache"),
             ("/ota/a.ipa/app.ipa", "private, max-age=0, must-revalidate"),
         ] {
             let mut response = Response::new(Body::empty());
@@ -1589,6 +1606,30 @@ mod tests {
             assert!(!APP_JS.contains(pattern), "inline handler {pattern} found");
         }
         assert!(INDEX_HTML.contains("<script src=\"/app.js\"></script>"));
+    }
+
+    #[test]
+    fn frontend_uses_lpak_icon_as_favicon() {
+        assert!(INDEX_HTML.contains(r#"<link rel="icon" type="image/png" href="/icon.png">"#));
+        assert!(INDEX_HTML.contains(r#"<link rel="apple-touch-icon" href="/icon.png">"#));
+    }
+
+    #[test]
+    fn download_jobs_show_percentage_progress() {
+        assert!(APP_JS.contains("function parseSize("));
+        // 百分比进度条与总量展示
+        assert!(
+            APP_JS.contains("job.total ? Math.min(100,Math.floor(job.downloaded/job.total*100))")
+        );
+        assert!(APP_JS.contains("width:${pct}%"));
+        assert!(APP_JS.contains("${fmtSize(job.downloaded)} / ${fmtSize(job.total)}"));
+        // 大小随下载请求提交，2FA 重试与登录重试都保留
+        assert!(APP_JS.contains("size:size || undefined"));
+        assert!(APP_JS.contains("size:challenge.total || null"));
+        assert!(APP_JS.contains(
+            "startDownload(retry.bundleId,retry.versionId,retry.platform,null,retry.size)"
+        ));
+        assert!(APP_JS.contains("data-size=\"${parseSize(entry.size) || ''}\""));
     }
 
     #[test]
@@ -1685,7 +1726,7 @@ mod tests {
         assert!(!search_panel.contains("data-platform="));
         assert!(APP_JS.contains("&platform=${encodeURIComponent(platform)}"));
         assert!(APP_JS.contains(
-            "body:JSON.stringify({bundle_id:bundleId,version_id:versionId || undefined,platform})"
+            "body:JSON.stringify({bundle_id:bundleId,version_id:versionId || undefined,platform,size:size || undefined})"
         ));
         assert!(APP_JS.contains("pendingDownload={bundleId,versionId,platform}"));
     }

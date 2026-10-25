@@ -131,6 +131,15 @@ function fmtSize(bytes) {
   while (bytes >= 1024 && index < units.length - 1) { bytes /= 1024; index++; }
   return bytes.toFixed(bytes >= 100 || index === 0 ? 0 : 1) + ' ' + units[index];
 }
+// 历史版本目录的体积字符串（如 "952.5 MB"）→ 字节数，失败返回 null
+function parseSize(text) {
+  const match = /^([\d.]+)\s*([KMGT]?)(?:B)?$/i.exec(String(text || '').trim());
+  if (!match) return null;
+  const value = parseFloat(match[1]);
+  if (!Number.isFinite(value)) return null;
+  const units = { '': 1, K: 1024, M: 1024 ** 2, G: 1024 ** 3, T: 1024 ** 4 };
+  return Math.round(value * (units[match[2].toUpperCase()] || 1));
+}
 function toast(message, isError=false) {
   const node = document.getElementById('toast');
   node.textContent = message; node.style.color = isError ? 'var(--ui-danger)' : 'var(--ui-text)'; node.style.display = 'block';
@@ -354,7 +363,7 @@ async function doLogin() {
     if (result.code_required) { const codeInput=document.getElementById('m-code'); codeInput.classList.remove('hidden'); document.querySelector('#modal-body h3').textContent='完成双重认证'; message.textContent='请输入受信任设备上显示的 6 位验证码'; button.textContent='验证并继续'; button.disabled=false; codeInput.focus(); return; }
     const retry=pendingDownload; pendingDownload=null;
     closeModal(); showAuthBanner(false); await refreshAccounts(); if (result.cleared_jobs) await pollJobs(); toast(`✅ 登录成功：${result.email}`);
-    if (retry) { toast('✅ 认证成功，正在重新发起下载'); await startDownload(retry.bundleId,retry.versionId,retry.platform); }
+    if (retry) { toast('✅ 认证成功，正在重新发起下载'); await startDownload(retry.bundleId,retry.versionId,retry.platform,null,retry.size); }
   } catch (error) { message.className='err'; message.textContent='❌ ' + error.message; button.disabled=false; }
 }
 async function logout(email) {
@@ -511,7 +520,7 @@ function showVersionDetail(versionId) {
   detailView.innerHTML=`<div class="detail-hero">${app.artwork_url ? `<img src="${esc(app.artwork_url)}" alt="">` : '<img alt="">'}<div><h3 class="detail-title" tabindex="-1">${esc(app.name || '应用详细信息')}</h3><div class="dim">${esc(app.artist_name || app.bundle_id || '')}</div></div></div>
     <div class="detail-grid">${detailRow('选定版本',entry.display_version)}${detailRow('设备',platformLabel(verState.platform))}${detailRow('版本 ID',entry.id,true)}${detailRow('发布日期',String(entry.release_date || '').slice(0,10))}${detailRow('安装包大小',entry.size)}${detailRow('当前版本',app.version)}${detailRow('最低系统',app.minimum_os_version ? `${platformOsLabel(verState.platform)} ${app.minimum_os_version}` : '-')}${detailRow('App Store ID',String(verState.appId),true)}${detailRow('地区',`${flag(verState.country)} ${verState.country}`)}${detailRow('价格',String(price))}${detailRow('Bundle ID',verState.bundleId,true)}</div>
     ${entry.release_notes ? `<div class="release-notes"><div class="release-notes-title">更新日志</div><p class="release-notes-content">${esc(entry.release_notes)}</p></div>` : ''}
-    <div class="detail-actions"><button type="button" class="ghost" data-act="back-to-versions">返回版本列表</button><button type="button" data-act="start-download" data-bundle="${arg(verState.bundleId)}" data-version-id="${arg(entry.id)}" data-platform="${arg(verState.platform)}">下载此版本</button></div>
+    <div class="detail-actions"><button type="button" class="ghost" data-act="back-to-versions">返回版本列表</button><button type="button" data-act="start-download" data-bundle="${arg(verState.bundleId)}" data-version-id="${arg(entry.id)}" data-platform="${arg(verState.platform)}" data-size="${parseSize(entry.size) || ''}">下载此版本</button></div>
     <div class="download-feedback hidden" id="download-feedback" role="status" aria-live="polite"></div>`;
   requestAnimationFrame(()=>detailView.querySelector('.detail-title')?.focus({preventScroll:true}));
 }
@@ -525,7 +534,7 @@ function backToVersionList() {
   });
 }
 const startingDownloads=new Set();
-async function startDownload(bundleId,versionId,platform='iphone',button=null) {
+async function startDownload(bundleId,versionId,platform='iphone',button=null,size=null) {
   const key=`${platform}\u0000${bundleId}\u0000${versionId || ''}`;
   if (startingDownloads.has(key)) { toast('正在准备这个版本，请稍候'); return; }
   startingDownloads.add(key);
@@ -540,7 +549,7 @@ async function startDownload(bundleId,versionId,platform='iphone',button=null) {
     feedback.textContent='正在创建下载任务，请稍候…';
   }
   try {
-    const result=await api('/api/downloads',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bundle_id:bundleId,version_id:versionId || undefined,platform})});
+    const result=await api('/api/downloads',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bundle_id:bundleId,version_id:versionId || undefined,platform,size:size || undefined})});
     toast(result.reused?'相同任务已在队列中':'✅ 已加入下载队列'); closeModal(true); showTab('download'); pollJobs();
   } catch (error) {
     toast('❌ '+error.message,true);
@@ -566,13 +575,15 @@ async function pollJobs() {
   completedJobIds=nextCompletedIds;
   if (!list.length) { box.innerHTML='<div class="dim">暂无任务</div>'; return false; }
   box.innerHTML=list.map(job => {
-    const done=job.status==='done', status={queued:'排队中',downloading:'下载中',done:'完成',error:'失败'}[job.status]||job.status;
-    const bar=done?'<div class="bar"><i style="width:100%"></i></div>':'<div class="bar"><i class="indet"></i></div>';
-    return `<div class="job-row"><div class="job-layout"><div class="job-main"><div style="font-weight:650">${esc(job.app_name||job.bundle_id)}</div><div class="dim" style="font-size:12px">${platformLabel(job.platform)} · ${esc(job.version_id||'latest')} · ${fmtSize(job.downloaded)}</div></div>${bar}<div class="job-status ${job.status==='error'?'err':(done?'ok':'dim')}">${esc(status)}</div></div>${job.error?`<div class="err" style="margin-top:5px;font-size:12px">${esc(job.error)}</div>`:''}</div>`;
+    const done=job.status==='done', pct=job.total ? Math.min(100,Math.floor(job.downloaded/job.total*100)) : null;
+    const status=done?'完成':job.status==='error'?'失败':job.status==='queued'?'排队中':(pct!=null?`${pct}%`:'下载中');
+    const bar=done?'<div class="bar"><i style="width:100%"></i></div>':(pct!=null?`<div class="bar"><i style="width:${pct}%"></i></div>`:'<div class="bar"><i class="indet"></i></div>');
+    const sizeText=job.total ? `${fmtSize(job.downloaded)} / ${fmtSize(job.total)}` : fmtSize(job.downloaded);
+    return `<div class="job-row"><div class="job-layout"><div class="job-main"><div style="font-weight:650">${esc(job.app_name||job.bundle_id)}</div><div class="dim" style="font-size:12px">${platformLabel(job.platform)} · ${esc(job.version_id||'latest')} · ${sizeText}</div></div>${bar}<div class="job-status ${job.status==='error'?'err':(done?'ok':'dim')}">${esc(status)}</div></div>${job.error?`<div class="err" style="margin-top:5px;font-size:12px">${esc(job.error)}</div>`:''}</div>`;
   }).join('');
   const challenge=list.find(job=>job.needs_2fa && !prompted2faJobs.has(job.id));
   if (challenge) {
-    prompted2faJobs.add(challenge.id); pendingDownload={bundleId:challenge.bundle_id,versionId:challenge.version_id || null,platform:challenge.platform || 'iphone'};
+    prompted2faJobs.add(challenge.id); pendingDownload={bundleId:challenge.bundle_id,versionId:challenge.version_id || null,platform:challenge.platform || 'iphone',size:challenge.total || null};
     showAuthBanner(true,true);
     openLoginModal(true,challenge.account,'下载任务需要双重认证。验证成功后会自动重试。');
   }
@@ -634,7 +645,7 @@ const ACTIONS = {
   'show-versions': el => showVersions(decodeURIComponent(el.dataset.bundle), Number(el.dataset.appId), decodeURIComponent(el.dataset.country), decodeURIComponent(el.dataset.platform)),
   'show-version-detail': el => showVersionDetail(el.dataset.versionId),
   'back-to-versions': () => backToVersionList(),
-  'start-download': el => startDownload(decodeURIComponent(el.dataset.bundle), decodeURIComponent(el.dataset.versionId), decodeURIComponent(el.dataset.platform), el),
+  'start-download': el => startDownload(decodeURIComponent(el.dataset.bundle), decodeURIComponent(el.dataset.versionId), decodeURIComponent(el.dataset.platform), el, el.dataset.size ? Number(el.dataset.size) : null),
   'append-versions': () => appendVersionBatch(),
   'install-file': el => installFile(decodeURIComponent(el.dataset.name), el),
   'delete-file': el => deleteFile(decodeURIComponent(el.dataset.name)),
