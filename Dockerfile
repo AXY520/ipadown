@@ -13,14 +13,15 @@ RUN --mount=type=cache,id=ipadown-cargo-registry,target=/usr/local/cargo/registr
 # ---------- 运行 ----------
 FROM debian:bookworm-slim
 ARG TARGETARCH
-ARG IPATOOL_VERSION=2.6.0
+ARG IPATOOL_VERSION=2.7.0
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 # ipatool：SAP 签名登录/下载依赖（2026-08 起苹果强制 X-Apple-ActionSignature）
+# 2.7.0 修复 redownload 请求被苹果 403 拒绝（空响应体）的问题
 RUN arch="${TARGETARCH:-amd64}" \
     && case "$arch" in \
-         amd64) expected="a8bbd8a5a6515d0b858c6cfe6c2baf70943a4235b7fa65d5bd01a42a7d5bedbb" ;; \
-         arm64) expected="7c7ce6c54379683d77b99d39f1d1a766fd8de3ae09ae8c4c64f5d04232e6ae80" ;; \
+         amd64) expected="68372de9743d468296f2dba5b413a3e7df56ad0c85b8d0f4f0f6c9b8b53a54e8" ;; \
+         arm64) expected="133c3fb754bafcd61698ba6047b48096c7033345529f57d7a83d281f8a403c23" ;; \
          *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
        esac \
     && curl -sfL --retry 5 --retry-all-errors --retry-delay 5 \

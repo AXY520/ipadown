@@ -503,6 +503,9 @@ pub(crate) fn friendly_msg(raw: &str) -> String {
         "账号未拥有该 App（免费 App 需先在手机 App Store「获取」一次，付费 App 需先购买）；若确认已拥有，则可能是登录会话过期，请重新登录".into()
     } else if l.contains("password token is expired") || l.contains("sign in required") {
         "登录会话已过期，请重新登录".into()
+    } else if l.contains("http 403") || l.contains("non-plist body") {
+        "苹果拒绝了下载请求（403）。若持续出现，请更新镜像中的 ipatool 版本，或更换 Apple ID 重试"
+            .into()
     } else if raw.contains("未找到登录账号") {
         "未登录或登录已失效，请登录 Apple ID".into()
     } else if l.contains("connection reset")
