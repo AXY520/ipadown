@@ -21,7 +21,7 @@ use tokio::io::AsyncSeekExt;
 const INDEX_HTML: &str = include_str!("../static/index.html");
 const APP_JS: &str = include_str!("../static/app.js");
 /// 网站图标（与 lpk 应用图标同源）
-const ICON_PNG: &[u8] = include_bytes!("../../../icon.png");
+const ICON_PNG: &[u8] = include_bytes!("../static/icon.png");
 
 /// 历史版本目录与 App Store 更新日志缓存有效期。
 const HISTORY_CACHE_TTL: Duration = Duration::from_secs(30 * 60);

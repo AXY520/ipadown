@@ -2,5 +2,5 @@ images:
   app:
     dockerfile: Dockerfile
     context: .
-icon: icon.png
+icon: crates/web/static/icon.png
 pkgout: .
