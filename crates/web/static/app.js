@@ -172,14 +172,18 @@ function closeCustomSelects(except='') {
     if (root.id === except) return;
     root.querySelector('.select-menu')?.classList.add('hidden');
     root.querySelector('.select-trigger')?.setAttribute('aria-expanded','false');
+    root.closest('.card')?.classList.remove('menu-open');
   });
 }
 function toggleCustomSelect(id, forceOpen) {
   const root = document.getElementById(id); if (!root) return;
   const menu = root.querySelector('.select-menu');
   const open = forceOpen ?? menu.classList.contains('hidden');
+  const card = root.closest('.card');
   if (open) closeDeviceMenu();
   closeCustomSelects(open ? id : '');
+  // 展开时抬升所在卡片层叠层级，避免菜单被相邻卡片遮挡
+  card?.classList.toggle('menu-open', open);
   menu.classList.toggle('hidden', !open); root.querySelector('.select-trigger').setAttribute('aria-expanded', String(open));
   if (open) requestAnimationFrame(() => (menu.querySelector('[aria-selected="true"]') || menu.querySelector('.select-option'))?.focus());
 }
@@ -206,6 +210,7 @@ function customSelectValue(id) { return document.getElementById(id)?.dataset.val
 document.addEventListener('pointerdown', event => {
   if (!event.target.closest('.custom-select')) closeCustomSelects();
   if (!event.target.closest('#device-nav')) closeDeviceMenu();
+  if (!event.target.closest('.swipe-row')) closeAllSwipeRows();
 });
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape' && !document.getElementById('device-menu')?.classList.contains('hidden')) closeDeviceMenu(true);
@@ -567,20 +572,37 @@ async function startDownload(bundleId,versionId,platform='iphone',button=null,si
 }
 
 let completedJobIds=null;
+let renderedJobIds='';
+const openSwipeRows=new Set();
+const SWIPE_ACTION_WIDTH=74;
+function jobStatusText(job,pct) {
+  if (job.status==='done') return '完成';
+  if (job.status==='error') return '失败';
+  if (job.status==='queued') return '排队中';
+  if (job.status==='paused') return '已暂停';
+  return pct!=null?`${pct}%`:'下载中';
+}
+function rowJobFilename(row) {
+  const suffix=row.dataset.platform==='ipad'?'_ipad':(row.dataset.platform==='appletv'?'_appletv':'');
+  return `${row.dataset.bundle}_${row.dataset.versionId||'latest'}${suffix}.ipa`;
+}
 async function pollJobs() {
   let list; try { list=await api('/api/downloads'); } catch { return false; }
   const box=document.getElementById('jobs');
   const nextCompletedIds=new Set(list.filter(job=>job.status==='done').map(job=>job.id));
   if (completedJobIds && [...nextCompletedIds].some(id=>!completedJobIds.has(id))) refreshFiles();
   completedJobIds=nextCompletedIds;
-  if (!list.length) { box.innerHTML='<div class="dim">暂无任务</div>'; return false; }
-  box.innerHTML=list.map(job => {
-    const done=job.status==='done', pct=job.total ? Math.min(100,Math.floor(job.downloaded/job.total*100)) : null;
-    const status=done?'完成':job.status==='error'?'失败':job.status==='queued'?'排队中':(pct!=null?`${pct}%`:'下载中');
-    const bar=done?'<div class="bar"><i style="width:100%"></i></div>':(pct!=null?`<div class="bar"><i style="width:${pct}%"></i></div>`:'<div class="bar"><i class="indet"></i></div>');
-    const sizeText=job.total ? `${fmtSize(job.downloaded)} / ${fmtSize(job.total)}` : fmtSize(job.downloaded);
-    return `<div class="job-row"><div class="job-layout"><div class="job-main"><div style="font-weight:650">${esc(job.app_name||job.bundle_id)}</div><div class="dim" style="font-size:12px">${platformLabel(job.platform)} · ${esc(job.version_id||'latest')} · ${sizeText}</div></div>${bar}<div class="job-status ${job.status==='error'?'err':(done?'ok':'dim')}">${esc(status)}</div></div>${job.error?`<div class="err" style="margin-top:5px;font-size:12px">${esc(job.error)}</div>`:''}</div>`;
-  }).join('');
+  const ids=list.map(job=>job.id).join(',');
+  if (!list.length) {
+    if (renderedJobIds!=='') { box.innerHTML='<div class="dim">暂无任务</div>'; renderedJobIds=''; }
+    return false;
+  }
+  if (ids!==renderedJobIds) {
+    renderedJobIds=ids;
+    box.innerHTML='';
+    list.forEach(job => box.appendChild(buildJobRow(job)));
+  }
+  list.forEach(job => updateJobRow(job));
   const challenge=list.find(job=>job.needs_2fa && !prompted2faJobs.has(job.id));
   if (challenge) {
     prompted2faJobs.add(challenge.id); pendingDownload={bundleId:challenge.bundle_id,versionId:challenge.version_id || null,platform:challenge.platform || 'iphone',size:challenge.total || null};
@@ -588,6 +610,106 @@ async function pollJobs() {
     openLoginModal(true,challenge.account,'下载任务需要双重认证。验证成功后会自动重试。');
   }
   return list.some(job=>job.status==='queued' || job.status==='downloading');
+}
+function buildJobRow(job) {
+  const row=document.createElement('div');
+  row.className='swipe-row';
+  row.dataset.jobId=job.id;
+  row.dataset.status=job.status;
+  row.dataset.bundle=job.bundle_id;
+  row.dataset.versionId=job.version_id||'';
+  row.dataset.platform=job.platform||'iphone';
+  row.innerHTML=`<button type="button" class="swipe-action" data-act="delete-job" data-id="${esc(job.id)}">删除</button>
+    <div class="swipe-content"><div class="job-row"><div class="job-layout"><div class="job-main"><div class="job-name"></div><div class="dim job-meta"></div></div><div class="bar"><i></i></div><div class="job-status dim"></div></div><div class="err job-error hidden"></div></div>`;
+  makeSwipeable(row, () => jobRowTapped(row));
+  updateJobRow(job);
+  return row;
+}
+function updateJobRow(job) {
+  const row=document.querySelector(`#jobs [data-job-id="${CSS.escape(job.id)}"]`); if (!row) return;
+  if (row.dataset.status!==job.status) { row.replaceWith(buildJobRow(job)); return; }
+  const done=job.status==='done', pct=job.total ? Math.min(100,Math.floor(job.downloaded/job.total*100)) : null;
+  const statusEl=row.querySelector('.job-status');
+  statusEl.textContent=jobStatusText(job,pct);
+  statusEl.className=`job-status ${job.status==='error'?'err':(done?'ok':'dim')}`;
+  const bar=row.querySelector('.bar > i');
+  if (done) { bar.classList.remove('indet'); bar.style.width='100%'; }
+  else if (pct!=null) { bar.classList.remove('indet'); bar.style.width=`${pct}%`; }
+  else { bar.classList.add('indet'); bar.style.width=''; }
+  const sizeText=job.total ? `${fmtSize(job.downloaded)} / ${fmtSize(job.total)}` : fmtSize(job.downloaded);
+  row.querySelector('.job-name').textContent=job.app_name||job.bundle_id;
+  row.querySelector('.job-meta').textContent=`${platformLabel(job.platform)} · ${job.version_id||'latest'} · ${sizeText}`;
+  const errorEl=row.querySelector('.job-error');
+  if (job.error) { errorEl.textContent=job.error; errorEl.classList.remove('hidden'); }
+  else { errorEl.classList.add('hidden'); errorEl.textContent=''; }
+}
+function jobRowTapped(row) {
+  const status=row.dataset.status, id=row.dataset.jobId;
+  if (status==='queued'||status==='downloading') { pauseJob(id); return; }
+  if (status==='paused') { resumeJob(id); return; }
+  if (status==='done') installFile(rowJobFilename(row),null);
+}
+async function pauseJob(id) {
+  try { await api(`/api/downloads/${encodeURIComponent(id)}/pause`,{method:'POST'}); toast('已暂停'); pollJobs(); }
+  catch (error) { toast('❌ '+error.message,true); }
+}
+async function resumeJob(id) {
+  try { await api(`/api/downloads/${encodeURIComponent(id)}/resume`,{method:'POST'}); toast('已继续下载'); pollJobs(); }
+  catch (error) { toast('❌ '+error.message,true); }
+}
+async function deleteJob(id) {
+  try { await api(`/api/downloads/${encodeURIComponent(id)}`,{method:'DELETE'}); toast('✅ 已删除'); pollJobs(); }
+  catch (error) { toast('❌ '+error.message,true); }
+}
+// ---------- 左滑手势（任务/文件通用） ----------
+function closeSwipeRow(row) {
+  const content=row.querySelector('.swipe-content'), action=row.querySelector('.swipe-action');
+  if (content) content.style.transform='';
+  if (action) action.style.transform='';
+  openSwipeRows.delete(row);
+}
+function closeAllSwipeRows(except=null) {
+  [...openSwipeRows].forEach(row => { if (row!==except && document.contains(row)) closeSwipeRow(row); });
+}
+function makeSwipeable(row,onTap) {
+  const content=row.querySelector('.swipe-content'), action=row.querySelector('.swipe-action');
+  let startX=0, startY=0, dragging=false, base=0, moved=false;
+  row.addEventListener('pointerdown', event => {
+    if (event.pointerType==='mouse' && event.button!==0) return;
+    dragging=true; moved=false;
+    startX=event.clientX; startY=event.clientY;
+    base=openSwipeRows.has(row)?-SWIPE_ACTION_WIDTH:0;
+    content.style.transition='none'; action.style.transition='none';
+  });
+  row.addEventListener('pointermove', event => {
+    if (!dragging) return;
+    const dx=event.clientX-startX, dy=event.clientY-startY;
+    if (!moved && Math.abs(dy)>Math.abs(dx) && Math.abs(dy)>8) { dragging=false; return; }
+    if (Math.abs(dx)>6) moved=true;
+    if (!moved) return;
+    closeAllSwipeRows(row);
+    const offset=Math.min(0,Math.max(-SWIPE_ACTION_WIDTH-24,base+dx));
+    content.style.transform=`translateX(${offset}px)`;
+    action.style.transform=`translateX(${offset}px)`;
+  });
+  const finish=event => {
+    if (!dragging) return; dragging=false;
+    content.style.transition=''; action.style.transition='';
+    const dx=event.clientX-startX;
+    const shouldOpen=(base+dx)<-SWIPE_ACTION_WIDTH/2;
+    if (shouldOpen) openSwipeRows.add(row); else openSwipeRows.delete(row);
+    const target=shouldOpen?-SWIPE_ACTION_WIDTH:0;
+    content.style.transform=`translateX(${target}px)`;
+    action.style.transform=`translateX(${target}px)`;
+  };
+  row.addEventListener('pointerup',finish);
+  row.addEventListener('pointercancel',finish);
+  row.addEventListener('click', event => {
+    if (event.target.closest('.swipe-action')) return;
+    if (openSwipeRows.has(row)) { closeSwipeRow(row); return; }
+    if (moved) return;
+    if (onTap) onTap();
+  });
 }
 async function keepJobsUpdated() {
   const active=await pollJobs();
@@ -597,19 +719,21 @@ async function refreshFiles() {
   let list; try { list=await api('/api/files'); } catch { return; }
   const box=document.getElementById('files'); if (!list.length) { box.innerHTML='<div class="dim">暂无文件</div>'; return; }
   box.innerHTML=`<div class="list-summary">${list.length} 个文件 · ${fmtSize(list.reduce((sum,file)=>sum+file.size,0))}</div><div class="file-list">`+
-    list.map(file => `<div class="file-row"><div class="file-icon">${file.artwork_url ? `<img src="${esc(file.artwork_url)}" loading="lazy" alt="">` : '↓'}</div>
-      <div class="file-info" title="${esc(file.name)}"><div class="file-title">${esc(file.title||file.bundle_id||file.name)}</div><div class="file-meta">${platformLabel(file.platform)} · ${esc(file.version||'版本未知')} · ${fmtSize(file.size)}</div></div>
-      <div class="file-actions"><button type="button" data-act="install-file" data-name="${arg(file.name)}">安装</button><button type="button" class="danger" data-act="delete-file" data-name="${arg(file.name)}">删除</button></div></div>`).join('')+'</div>';
+    list.map(file => `<div class="swipe-row" data-name="${arg(file.name)}"><button type="button" class="swipe-action" data-act="delete-file" data-name="${arg(file.name)}">删除</button>
+      <div class="swipe-content"><div class="file-row"><div class="file-icon">${file.artwork_url ? `<img src="${esc(file.artwork_url)}" loading="lazy" alt="">` : '↓'}</div>
+      <div class="file-info" title="${esc(file.name)}"><div class="file-title">${esc(file.title||file.bundle_id||file.name)}</div><div class="file-meta">${platformLabel(file.platform)} · ${esc(file.version||'版本未知')} · ${fmtSize(file.size)}</div></div></div></div>`).join('')+'</div>';
+  box.querySelectorAll('.swipe-row').forEach(row => makeSwipeable(row, () => installFile(decodeURIComponent(row.dataset.name),null)));
 }
-async function installFile(name,button) {
+async function installFile(name,button=null) {
   if (!safariBrowser) { toast('安装必须使用 Safari',true); return; }
-  const previous=button.textContent; button.disabled=true; button.textContent='正在唤起…';
+  const previous=button?.textContent;
+  if (button) { button.disabled=true; button.textContent='正在唤起…'; }
   try {
     const result=await api(`/api/install/${encodeURIComponent(name)}`);
     if (!result.install?.https) throw new Error('安装地址不是受信 HTTPS，请检查 PUBLIC_BASE_URL');
     window.location.href=result.install.itms_url;
-  } catch (error) { toast('❌ '+error.message,true); button.disabled=false; button.textContent=previous; }
-  setTimeout(() => { if (document.contains(button)) { button.disabled=false; button.textContent=previous; } },2200);
+  } catch (error) { toast('❌ '+error.message,true); if (button) { button.disabled=false; button.textContent=previous; } }
+  if (button) setTimeout(() => { if (document.contains(button)) { button.disabled=false; button.textContent=previous; } },2200);
 }
 async function deleteFile(name) {
   if (!confirm(`删除 ${name}？此操作不可撤销。`)) return;
@@ -647,7 +771,7 @@ const ACTIONS = {
   'back-to-versions': () => backToVersionList(),
   'start-download': el => startDownload(decodeURIComponent(el.dataset.bundle), decodeURIComponent(el.dataset.versionId), decodeURIComponent(el.dataset.platform), el, el.dataset.size ? Number(el.dataset.size) : null),
   'append-versions': () => appendVersionBatch(),
-  'install-file': el => installFile(decodeURIComponent(el.dataset.name), el),
+  'delete-job': el => deleteJob(el.dataset.id),
   'delete-file': el => deleteFile(decodeURIComponent(el.dataset.name)),
 };
 document.addEventListener('click', event => {

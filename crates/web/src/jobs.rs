@@ -71,12 +71,15 @@ pub(super) fn needs_two_factor(error: &store::StoreError) -> bool {
 #[derive(Clone)]
 pub(super) struct Registry {
     jobs: Arc<Mutex<HashMap<String, Job>>>,
+    /// 每个活跃任务句柄，用于暂停/删除时中止子进程
+    handles: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
     permits: Arc<Semaphore>,
 }
 
 pub(super) fn new_registry() -> Registry {
     Registry {
         jobs: Arc::new(Mutex::new(HashMap::new())),
+        handles: Arc::new(Mutex::new(HashMap::new())),
         permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS)),
     }
 }
@@ -92,6 +95,15 @@ fn unix_now() -> u64 {
 fn jobs_map(registry: &Registry) -> std::sync::MutexGuard<'_, HashMap<String, Job>> {
     registry
         .jobs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn handles_map(
+    registry: &Registry,
+) -> std::sync::MutexGuard<'_, HashMap<String, tokio::task::AbortHandle>> {
+    registry
+        .handles
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -237,12 +249,29 @@ pub(super) fn spawn_download(
         return Ok(true);
     };
 
+    launch_download_task(&reg, id, bundle_id, version_id, platform, filename, ipatool);
+    Ok(false)
+}
+
+/// 启动实际执行下载的 tokio 任务并登记句柄。
+/// 任务结束时自动注销句柄；暂停/删除时用句柄中止（子进程随 kill_on_drop 终止）。
+#[allow(clippy::too_many_arguments)]
+fn launch_download_task(
+    reg: &Registry,
+    id: String,
+    bundle_id: String,
+    version_id: Option<String>,
+    platform: store::search::DevicePlatform,
+    filename: String,
+    ipatool: store::ipatool::Ipatool,
+) {
+    let task_reg = reg.clone();
     let task_id = id.clone();
-    tokio::spawn(async move {
-        match reg.permits.clone().acquire_owned().await {
+    let handle = tokio::spawn(async move {
+        match task_reg.permits.clone().acquire_owned().await {
             Ok(_permit) => {
                 if let Err(e) = run_download(
-                    &reg,
+                    &task_reg,
                     &task_id,
                     &bundle_id,
                     version_id.as_deref(),
@@ -258,18 +287,100 @@ pub(super) fn spawn_download(
                         version_id.as_deref().unwrap_or("latest"),
                         platform.ipatool_value()
                     );
-                    update(&reg, &task_id, |job| job.record_failure(&e));
+                    update(&task_reg, &task_id, |job| job.record_failure(&e));
                 }
             }
-            Err(_) => update(&reg, &task_id, |job| {
+            Err(_) => update(&task_reg, &task_id, |job| {
                 job.record_failure(&store::StoreError::UnexpectedResponse(
                     "下载队列已停止".into(),
                 ));
             }),
         }
-        prune_finished(&reg);
+        prune_finished(&task_reg);
+        handles_map(&task_reg).remove(&task_id);
     });
-    Ok(false)
+    handles_map(reg).insert(id, handle.abort_handle());
+}
+
+/// 暂停：中止任务与 ipatool 子进程，保留 .tmp 断点，状态置 paused。
+pub(super) fn pause_job(reg: &Registry, id: &str) -> Result<(), &'static str> {
+    let mut jobs = jobs_map(reg);
+    let Some(job) = jobs.get_mut(id) else {
+        return Err("任务不存在");
+    };
+    if !matches!(job.status.as_str(), "queued" | "downloading") {
+        return Err("任务不在进行中，无法暂停");
+    }
+    if let Some(handle) = handles_map(reg).remove(id) {
+        handle.abort();
+    }
+    job.status = "paused".into();
+    job.error = None;
+    store::log_info!("download", "job paused id={id}");
+    Ok(())
+}
+
+/// 继续已暂停的任务：复用原任务记录，ipatool 从 .tmp 断点续传。
+pub(super) fn resume_job(
+    reg: &Registry,
+    id: &str,
+    ipatool: store::ipatool::Ipatool,
+) -> Result<(), &'static str> {
+    {
+        let jobs = jobs_map(reg);
+        let Some(job) = jobs.get(id) else {
+            return Err("任务不存在");
+        };
+        if job.status != "paused" {
+            return Err("任务未处于暂停状态");
+        }
+        let duplicated = jobs.values().any(|other| {
+            other.id != id
+                && other.bundle_id == job.bundle_id
+                && other.version_id.as_deref() == job.version_id.as_deref()
+                && other.platform == job.platform
+                && matches!(other.status.as_str(), "queued" | "downloading")
+        });
+        if duplicated {
+            return Err("相同任务已在进行中");
+        }
+    }
+    let (bundle_id, version_id, platform) = {
+        let mut jobs = jobs_map(reg);
+        let job = jobs.get_mut(id).expect("任务刚校验过");
+        job.status = "queued".into();
+        job.error = None;
+        (job.bundle_id.clone(), job.version_id.clone(), job.platform)
+    };
+    let filename = download_filename(&bundle_id, version_id.as_deref(), platform)?;
+    store::log_info!("download", "job resumed id={id}");
+    launch_download_task(
+        reg,
+        id.to_string(),
+        bundle_id,
+        version_id,
+        platform,
+        filename,
+        ipatool,
+    );
+    Ok(())
+}
+
+/// 删除任务记录；进行中的任务会先被中止。
+pub(super) fn remove_job(reg: &Registry, id: &str) -> bool {
+    let removed = jobs_map(reg).remove(id).is_some();
+    if removed {
+        if let Some(handle) = handles_map(reg).remove(id) {
+            handle.abort();
+        }
+        store::log_info!("download", "job removed id={id}");
+    }
+    removed
+}
+
+/// 任务归属账号（用于继续下载时构建对应账号的 ipatool）。
+pub(super) fn job_account(reg: &Registry, id: &str) -> Option<String> {
+    jobs_map(reg).get(id).map(|job| job.account.clone())
 }
 
 async fn run_download(
@@ -315,6 +426,13 @@ async fn run_download(
     let watcher = tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            // 任务被暂停/删除后自动退出，避免残留监视协程
+            let active = jobs_map(&reg_w)
+                .get(&id_w)
+                .is_some_and(|job| matches!(job.status.as_str(), "queued" | "downloading"));
+            if !active {
+                break;
+            }
             let size = match tokio::fs::metadata(&tmp_path).await {
                 Ok(meta) => meta.len(),
                 Err(_) => tokio::fs::metadata(&watch_output)
@@ -349,8 +467,8 @@ async fn run_download(
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_two_factor_failures, download_filename, list, new_registry, reserve_job, Job,
-        MAX_PENDING_DOWNLOADS,
+        clear_two_factor_failures, download_filename, job_account, jobs_map, list, new_registry,
+        pause_job, remove_job, reserve_job, Job, MAX_PENDING_DOWNLOADS,
     };
     use ipadown_store::search::DevicePlatform;
     use ipadown_store::StoreError;
@@ -505,6 +623,32 @@ mod tests {
             None
         )
         .is_err());
+    }
+
+    #[test]
+    fn pause_and_remove_manage_job_lifecycle() {
+        let registry = new_registry();
+        let mut job = Job::new(
+            "job-1",
+            "com.example.app",
+            Some("1"),
+            DevicePlatform::Iphone,
+            "a@example.com",
+            None,
+        );
+        job.status = "downloading".into();
+        jobs_map(&registry).insert(job.id.clone(), job);
+
+        assert!(pause_job(&registry, "job-1").is_ok());
+        assert_eq!(list(&registry)[0].status, "paused");
+        assert!(pause_job(&registry, "job-1").is_err());
+        assert_eq!(
+            job_account(&registry, "job-1").as_deref(),
+            Some("a@example.com")
+        );
+        assert!(remove_job(&registry, "job-1"));
+        assert!(list(&registry).is_empty());
+        assert!(!remove_job(&registry, "job-1"));
     }
 
     #[test]

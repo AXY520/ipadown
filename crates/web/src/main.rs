@@ -403,6 +403,18 @@ async fn main() {
             "/api/downloads",
             axum::routing::get(api_downloads).post(api_download_start),
         )
+        .route(
+            "/api/downloads/{id}/pause",
+            axum::routing::post(api_download_pause),
+        )
+        .route(
+            "/api/downloads/{id}/resume",
+            axum::routing::post(api_download_resume),
+        )
+        .route(
+            "/api/downloads/{id}",
+            axum::routing::delete(api_download_delete),
+        )
         .route("/api/files", axum::routing::get(api_files))
         .route("/api/files/{file}", axum::routing::delete(api_file_delete))
         .route("/api/install/{file}", axum::routing::get(api_install));
@@ -928,6 +940,42 @@ async fn api_versions(State(s): State<AppState>, Query(q): Query<VersionsQuery>)
 
 async fn api_downloads(State(s): State<AppState>) -> impl IntoResponse {
     Json(jobs::list(&s.jobs))
+}
+
+/// 暂停进行中的下载（中止 ipatool 子进程，保留断点）
+async fn api_download_pause(State(s): State<AppState>, Path(id): Path<String>) -> Response {
+    match jobs::pause_job(&s.jobs, &id) {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(message) => err_json(StatusCode::BAD_REQUEST, message),
+    }
+}
+
+/// 继续已暂停的下载（ipatool 从 .tmp 断点续传）
+async fn api_download_resume(State(s): State<AppState>, Path(id): Path<String>) -> Response {
+    let Some(account) = jobs::job_account(&s.jobs, &id) else {
+        return err_json(StatusCode::NOT_FOUND, "任务不存在");
+    };
+    let cfg = match store::config::Config::load_or_create() {
+        Ok(c) => c,
+        Err(e) => return store_err(e),
+    };
+    let ipatool = match store::ipatool::Ipatool::for_account(&cfg, &account) {
+        Ok(c) => c,
+        Err(e) => return store_err(e),
+    };
+    match jobs::resume_job(&s.jobs, &id, ipatool) {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(message) => err_json(StatusCode::BAD_REQUEST, message),
+    }
+}
+
+/// 删除任务记录（进行中的任务先中止）
+async fn api_download_delete(State(s): State<AppState>, Path(id): Path<String>) -> Response {
+    if jobs::remove_job(&s.jobs, &id) {
+        Json(serde_json::json!({ "ok": true })).into_response()
+    } else {
+        err_json(StatusCode::NOT_FOUND, "任务不存在")
+    }
 }
 
 #[derive(Deserialize)]
@@ -1630,7 +1678,7 @@ mod tests {
         assert!(
             APP_JS.contains("job.total ? Math.min(100,Math.floor(job.downloaded/job.total*100))")
         );
-        assert!(APP_JS.contains("width:${pct}%"));
+        assert!(APP_JS.contains("bar.style.width=`${pct}%`"));
         assert!(APP_JS.contains("${fmtSize(job.downloaded)} / ${fmtSize(job.total)}"));
         // 大小随下载请求提交，2FA 重试与登录重试都保留
         assert!(APP_JS.contains("size:size || undefined"));
@@ -1639,6 +1687,36 @@ mod tests {
             "startDownload(retry.bundleId,retry.versionId,retry.platform,null,retry.size)"
         ));
         assert!(APP_JS.contains("data-size=\"${parseSize(entry.size) || ''}\""));
+    }
+
+    #[test]
+    fn download_jobs_and_files_use_swipe_actions_with_pause_resume() {
+        // 左滑手势基础设施
+        assert!(APP_JS.contains("function makeSwipeable("));
+        assert!(APP_JS.contains("class=\"swipe-action\""));
+        assert!(INDEX_HTML.contains(".swipe-row { position:relative; overflow:hidden;"));
+        // 任务：左滑删除，点击暂停/继续/安装
+        assert!(APP_JS.contains("data-act=\"delete-job\""));
+        assert!(APP_JS.contains("${encodeURIComponent(id)}/pause`,{method:'POST'}"));
+        assert!(APP_JS.contains("${encodeURIComponent(id)}/resume`,{method:'POST'}"));
+        assert!(APP_JS.contains("${encodeURIComponent(id)}`,{method:'DELETE'}"));
+        assert!(APP_JS.contains("status==='paused'"));
+        assert!(APP_JS.contains("'已暂停'"));
+        // 文件：点击安装，左滑删除（不再有内联按钮）
+        assert!(!APP_JS.contains("data-act=\"install-file\""));
+        assert!(APP_JS.contains(
+            "makeSwipeable(row, () => installFile(decodeURIComponent(row.dataset.name),null))"
+        ));
+        // 进度轮询改为行内更新，避免滑动手势被重绘打断
+        assert!(APP_JS.contains("function buildJobRow("));
+        assert!(APP_JS.contains("function updateJobRow("));
+    }
+
+    #[test]
+    fn custom_select_dropdown_raises_its_card_above_siblings() {
+        assert!(INDEX_HTML.contains(".card.menu-open { z-index:6; }"));
+        assert!(APP_JS.contains("classList.toggle('menu-open', open)"));
+        assert!(APP_JS.contains("root.closest('.card')?.classList.remove('menu-open')"));
     }
 
     #[test]
