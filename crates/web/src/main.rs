@@ -823,7 +823,13 @@ async fn api_search(Query(q): Query<SearchQuery>) -> Response {
     .await
     {
         Ok(results) => Json(results).into_response(),
-        Err(e) => store_err(e),
+        Err(e) => {
+            store::log_warn!(
+                "search",
+                "search failed term={term} country={country} error={e}"
+            );
+            store_err(e)
+        }
     }
 }
 

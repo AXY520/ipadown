@@ -92,7 +92,7 @@ pub async fn lookup(bundle_id: &str, country: &str, platform: DevicePlatform) ->
 
 #[cfg(test)]
 mod tests {
-    use super::DevicePlatform;
+    use super::{DevicePlatform, SearchResponse};
 
     #[test]
     fn platforms_map_to_store_entities_and_ipatool_values() {
@@ -116,5 +116,15 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_string(&platform).unwrap(), expected);
         }
+    }
+
+    /// 中国 CDN 会把 fileSizeBytes 序列化成字符串，真实抓包回归。
+    #[test]
+    fn parses_cn_cdn_search_response_with_string_file_size() {
+        let raw = include_bytes!("../testdata/cn-cdn-search.json");
+        let resp: SearchResponse = serde_json::from_slice(raw).unwrap();
+        assert!(resp.results.len() >= 2);
+        assert_eq!(resp.results[0].file_size_bytes, Some(998_750_208));
+        assert_eq!(resp.results[0].bundle_id, "com.tencent.xin");
     }
 }

@@ -1,5 +1,27 @@
 use serde::{Deserialize, Serialize};
 
+/// 苹果中国 CDN（ksyuncdn）会把 fileSizeBytes 序列化成字符串（"998750208"），
+/// 数字与数字字符串都接受。
+fn flexible_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde_json::Value;
+    match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom("fileSizeBytes 不是合法的非负整数")),
+        Some(Value::String(text)) => text
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|_| serde::de::Error::custom("fileSizeBytes 不是合法的非负整数")),
+        Some(_) => Err(serde::de::Error::custom("fileSizeBytes 不是合法的非负整数")),
+    }
+}
+
 /// 搜索/lookup 返回的 App 信息（字段名对齐 iTunes Search API）
 #[derive(Serialize, Deserialize)]
 pub struct Software {
@@ -32,6 +54,7 @@ pub struct Software {
     pub formatted_price: Option<String>,
     #[serde(
         rename(deserialize = "fileSizeBytes", serialize = "file_size_bytes"),
+        deserialize_with = "flexible_u64",
         default
     )]
     /// 当前版本安装包大小（字节），用作 latest 下载的进度条总量
