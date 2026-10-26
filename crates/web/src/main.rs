@@ -353,6 +353,19 @@ async fn main() {
         let _ = shutdown_sender.send(true);
     });
 
+    // 苹果边缘节点存在「部分 A 记录在国内网络被 RST」的现像（17.36.x 已两次隔数小时
+    // 复现），而 DNS 可能只返回坏 IP。启动时逐个测试，坏则从公共 DoH 取全量
+    // A 记录找一个可用的 pin 进 /etc/hosts（容器内 root，ipatool/Go 同样读到）。
+    // 整体限时，失败不阻断启动。
+    if let Err(error) = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        store::apple_edge::pin_hosts(),
+    )
+    .await
+    {
+        store::log_warn!("startup", "apple edge pin timed out: {error}");
+    }
+
     // 启动时固化配置（确保 keychain_passphrase 等字段落盘，避免每次启动重新生成）
     match store::config::Config::load_or_create() {
         Ok(mut cfg) => {
