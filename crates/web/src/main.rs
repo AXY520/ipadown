@@ -365,6 +365,8 @@ async fn main() {
     {
         store::log_warn!("startup", "apple edge pin timed out: {error}");
     }
+    // 每 10 分钟复检：DNS 轮换出可用 IP 或 pin 失效时自动调整
+    tokio::spawn(store::apple_edge::periodic_recheck());
 
     // 启动时固化配置（确保 keychain_passphrase 等字段落盘，避免每次启动重新生成）
     match store::config::Config::load_or_create() {

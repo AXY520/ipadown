@@ -6,8 +6,14 @@ use crate::{log_info, log_warn};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
+const PIN_MARK: &str = "# ipadown-pin";
+
 /// 需要自检的节点（ipatool 依赖，非中国 CDN 域）
 const EDGE_HOSTS: &[&str] = &["uclient-api.itunes.apple.com"];
+
+/// 已知可用 IP 兜底候选（中国 DNS 可能只返回坏 IP，DoH 同源拿不到别的；
+/// pin 前仍会探测验证，IP 失效则跳过）。发现新的可用 IP 时应更新此列表。
+const KNOWN_GOOD_CANDIDATES: &[&str] = &["17.56.138.66"];
 
 /// uclient-api 的连通性探针路径（无需认证，返回 200）
 const EDGE_PROBE_PATH: &str = "/WebObjects/MZStorePlatform.woa/wa/lookup?caller=MDM&cc=cn&id=414478124&l=en&p=mdm-lockup&platform=enterprisestore&version=2";
@@ -18,43 +24,78 @@ pub async fn pin_hosts() {
     }
 }
 
+/// 周期性复检：DNS 轮换、pin 的 IP 失效时自动换新或移除。由 web 启动时 spawn。
+pub async fn periodic_recheck() {
+    let mut ticker = tokio::time::interval(Duration::from_secs(600));
+    loop {
+        ticker.tick().await;
+        pin_hosts().await;
+    }
+}
+
 async fn pin_host(host: &str) {
+    let pinned = read_hosts_pin(host);
     let system_ips: Vec<IpAddr> = (host, 443)
         .to_socket_addrs()
         .map(|addrs| addrs.map(|a| a.ip()).collect())
         .unwrap_or_default();
-    for ip in &system_ips {
-        if reachable(host, ip).await {
-            return; // 系统 DNS 给出的 IP 至少一个可用，不干预
+
+    // 当前 pin（或系统默认）可用 → 无事可做
+    let effective = pinned.or_else(|| system_ips.first().copied());
+    if let Some(ip) = effective {
+        if reachable(host, &ip).await {
+            return;
         }
     }
-    // 系统 DNS 全挂（或为空）：公共 DoH 拿全量 A 记录找可用 IP
+
+    // 候选：系统 DNS + DoH + 已知可用兜底；优先换到与当前不同的 IP
     let mut candidates = doh_lookup(host).await;
     for ip in &system_ips {
         if !candidates.contains(ip) {
             candidates.push(*ip);
         }
     }
+    for raw in KNOWN_GOOD_CANDIDATES {
+        if let Ok(ip) = raw.parse() {
+            if !candidates.contains(&ip) {
+                candidates.push(ip);
+            }
+        }
+    }
+    candidates.retain(|ip| Some(*ip) != effective);
     for ip in &candidates {
         if !reachable(host, ip).await {
             continue;
         }
         match write_hosts_pin(host, ip) {
             Ok(()) => log_info!(
-                "startup",
-                "apple edge pinned host={host} ip={ip} (system DNS IPs unusable)"
+                "apple-edge",
+                "pinned host={host} ip={ip} (previous/default unusable)"
             ),
-            Err(error) => log_warn!(
-                "startup",
-                "apple edge pin failed host={host} ip={ip} error={error}"
-            ),
+            Err(error) => log_warn!("apple-edge", "pin failed host={host} ip={ip} error={error}"),
         }
         return;
     }
-    log_warn!(
-        "startup",
-        "apple edge all candidate IPs unreachable host={host} (left as-is)"
-    );
+    // 全部不可用：移除失效 pin 交还系统 DNS（无 pin 则保持现状）
+    if pinned.is_some() {
+        match remove_hosts_pin(host) {
+            Ok(()) => log_warn!(
+                "apple-edge",
+                "removed stale pin host={host} (no reachable candidate, back to DNS)"
+            ),
+            Err(error) => {
+                log_warn!(
+                    "apple-edge",
+                    "remove stale pin failed host={host} error={error}"
+                )
+            }
+        }
+    } else {
+        log_warn!(
+            "apple-edge",
+            "all candidate IPs unreachable host={host} (left as-is)"
+        );
+    }
 }
 
 /// 对指定 IP 做 TLS 探测（resolve 固定 IP，不经过系统 DNS）
@@ -111,15 +152,32 @@ async fn doh_lookup(host: &str) -> Vec<IpAddr> {
     result
 }
 
-/// 把可用 IP 写入 /etc/hosts（容器内 root；同一 host 已有 pin 则替换）
-fn write_hosts_pin(host: &str, ip: &IpAddr) -> std::io::Result<()> {
-    const PIN_MARK: &str = "# ipadown-pin";
+/// 读取当前 pin 的 IP（无则 None）
+fn read_hosts_pin(host: &str) -> Option<IpAddr> {
+    let content = std::fs::read_to_string("/etc/hosts").ok()?;
+    content
+        .lines()
+        .find(|line| line.contains(host) && line.trim_end().ends_with(PIN_MARK))
+        .and_then(|line| line.split_whitespace().next())
+        .and_then(|ip| ip.parse().ok())
+}
+
+/// 移除 pin（交还系统 DNS）
+fn remove_hosts_pin(host: &str) -> std::io::Result<()> {
     let content = std::fs::read_to_string("/etc/hosts")?;
-    let mut kept: Vec<String> = content
+    let kept: Vec<String> = content
         .lines()
         .filter(|line| !(line.contains(host) && line.trim_end().ends_with(PIN_MARK)))
         .map(str::to_string)
         .collect();
+    std::fs::write("/etc/hosts", kept.join("\n") + "\n")
+}
+
+/// 把可用 IP 写入 /etc/hosts（容器内 root；同一 host 已有 pin 则替换）
+fn write_hosts_pin(host: &str, ip: &IpAddr) -> std::io::Result<()> {
+    remove_hosts_pin(host)?;
+    let content = std::fs::read_to_string("/etc/hosts")?;
+    let mut kept: Vec<String> = content.lines().map(str::to_string).collect();
     kept.push(format!("{ip} {host} {PIN_MARK}"));
     std::fs::write("/etc/hosts", kept.join("\n") + "\n")
 }
