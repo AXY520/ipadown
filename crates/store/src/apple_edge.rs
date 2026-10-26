@@ -126,8 +126,6 @@ fn write_hosts_pin(host: &str, ip: &IpAddr) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// 解析出的 IP 与 DoH 结果合并去重，保证候选完整
     #[test]
     fn hosts_pin_replaces_previous_entry_for_same_host() {
